@@ -1,0 +1,15 @@
+version: '3.3'
+
+services:
+  wakeup-coach:
+    build: .
+    container_name: wakeup-coach
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./config:/app/config
+    env_file:
+      - .env
+    environment:
+      - TZ=America/New_York  # Change this to your timezone 
