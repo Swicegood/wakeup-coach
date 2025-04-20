@@ -1,12 +1,18 @@
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request, Response
 from twilio.rest import Client
 from twilio.twiml.voice_response import VoiceResponse, Gather
 from openai import OpenAI
 import os
 from dotenv import load_dotenv
 import asyncio
-from datetime import datetime
+from datetime import datetime, timedelta
 import pytz
+from pydantic import BaseModel
+import logging
+
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logger = logging.getLogger("wakeup-coach")
 
 # Load environment variables
 load_dotenv()
@@ -28,9 +34,23 @@ openai_client = OpenAI(
 )
 
 # Configuration
-WAKE_UP_TIME = os.getenv("WAKE_UP_TIME", "07:00")  # Default to 7 AM
+WAKE_UP_TIME = os.getenv("WAKE_UP_TIME", "06:00")  # Default to 6 AM
 PHONE_NUMBER = os.getenv("PHONE_NUMBER")
 TWILIO_PHONE_NUMBER = os.getenv("TWILIO_PHONE_NUMBER")
+INTERNAL_PORT = os.getenv("PORT", "8000")
+EXTERNAL_PORT = os.getenv("EXTERNAL_PORT", "8765")
+SERVER_IP = os.getenv("SERVER_IP", "YOUR_SERVER_IP")  # Your server's IP address
+BASE_URL = os.getenv("BASE_URL", f"http://{SERVER_IP}:{EXTERNAL_PORT}")
+
+# Log configuration
+logger.info(f"Configuration loaded: WAKE_UP_TIME={WAKE_UP_TIME}, PHONE_NUMBER={PHONE_NUMBER}, TWILIO_PHONE_NUMBER={TWILIO_PHONE_NUMBER}")
+logger.info(f"BASE_URL={BASE_URL}")
+
+# Store scheduled tasks
+scheduled_tasks = {}
+
+class ScheduleRequest(BaseModel):
+    minutes_from_now: int = 1
 
 @app.get("/")
 async def root():
@@ -40,78 +60,108 @@ async def root():
 async def test_call():
     """Test endpoint to initiate a call immediately"""
     try:
+        logger.info(f"Initiating test call to {PHONE_NUMBER} from {TWILIO_PHONE_NUMBER}")
         call = twilio_client.calls.create(
             to=PHONE_NUMBER,
             from_=TWILIO_PHONE_NUMBER,
-            url=f"{os.getenv('BASE_URL')}/voice"
+            url=f"{BASE_URL}/voice"
         )
+        logger.info(f"Test call initiated with SID: {call.sid}")
         return {"status": "Test call initiated", "call_sid": call.sid}
     except Exception as e:
+        logger.error(f"Error initiating test call: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/schedule-test")
+async def schedule_test(request: ScheduleRequest):
+    """Schedule a test call for a specific time in the future"""
+    try:
+        minutes = request.minutes_from_now
+        if minutes < 1:
+            minutes = 1  # Ensure at least 1 minute
+        
+        # Calculate when the call should be made
+        now = datetime.now(pytz.timezone(os.getenv("TZ", "America/New_York")))
+        scheduled_time = now + timedelta(minutes=minutes)
+        
+        # Create a task to make the call after the specified delay
+        task_id = f"test_call_{datetime.now().strftime('%Y%m%d%H%M%S')}"
+        
+        async def delayed_call():
+            await asyncio.sleep(minutes * 60)  # Convert minutes to seconds
+            try:
+                logger.info(f"Making scheduled call to {PHONE_NUMBER} from {TWILIO_PHONE_NUMBER}")
+                call = twilio_client.calls.create(
+                    to=PHONE_NUMBER,
+                    from_=TWILIO_PHONE_NUMBER,
+                    url=f"{BASE_URL}/voice"
+                )
+                logger.info(f"Scheduled test call made at {datetime.now()} with SID: {call.sid}")
+                if task_id in scheduled_tasks:
+                    del scheduled_tasks[task_id]
+            except Exception as e:
+                logger.error(f"Error making scheduled call: {str(e)}")
+        
+        # Store the task
+        scheduled_tasks[task_id] = asyncio.create_task(delayed_call())
+        logger.info(f"Test call scheduled for {scheduled_time.strftime('%Y-%m-%d %H:%M:%S')} with task_id: {task_id}")
+        
+        return {
+            "status": "Test call scheduled",
+            "scheduled_time": scheduled_time.strftime("%Y-%m-%d %H:%M:%S"),
+            "task_id": task_id
+        }
+    except Exception as e:
+        logger.error(f"Error scheduling test call: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/cancel-scheduled/{task_id}")
+async def cancel_scheduled(task_id: str):
+    """Cancel a scheduled test call"""
+    if task_id in scheduled_tasks:
+        scheduled_tasks[task_id].cancel()
+        del scheduled_tasks[task_id]
+        logger.info(f"Scheduled call cancelled: {task_id}")
+        return {"status": "Scheduled call cancelled", "task_id": task_id}
+    else:
+        logger.warning(f"Attempted to cancel non-existent task: {task_id}")
+        raise HTTPException(status_code=404, detail="Task not found")
+
+@app.get("/list-scheduled")
+async def list_scheduled():
+    """List all scheduled test calls"""
+    logger.info(f"Listing scheduled tasks: {list(scheduled_tasks.keys())}")
+    return {
+        "scheduled_tasks": list(scheduled_tasks.keys())
+    }
 
 @app.post("/call")
 async def initiate_call():
     """Initiate a wake-up call"""
     try:
+        logger.info(f"Initiating wake-up call to {PHONE_NUMBER} from {TWILIO_PHONE_NUMBER}")
         call = twilio_client.calls.create(
             to=PHONE_NUMBER,
             from_=TWILIO_PHONE_NUMBER,
-            url=f"{os.getenv('BASE_URL')}/voice"
+            url=f"{BASE_URL}/voice"
         )
+        logger.info(f"Wake-up call initiated with SID: {call.sid}")
         return {"status": "Call initiated", "call_sid": call.sid}
     except Exception as e:
+        logger.error(f"Error initiating wake-up call: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/voice")
 async def handle_call():
     """Handle the voice call and generate response"""
-    response = VoiceResponse()
-    
-    # Initial greeting
-    response.say("Good morning! Time to wake up. How are you feeling?")
-    
-    # Gather user's response
-    gather = Gather(
-        input='speech',
-        action='/handle-response',
-        method='POST',
-        language='en-US',
-        speechTimeout='auto'
-    )
-    response.append(gather)
-    
-    return str(response)
-
-@app.post("/handle-response")
-async def handle_response(request: Request):
-    """Process user's response and generate AI response"""
-    form_data = await request.form()
-    user_speech = form_data.get('SpeechResult', '')
-    
-    # Generate AI response using OpenAI
+    logger.info("Handling incoming voice call")
     try:
-        # Create a chat completion with the latest API
-        completion = openai_client.chat.completions.create(
-            model="gpt-4",
-            messages=[
-                {
-                    "role": "system",
-                    "content": "You are a supportive wake-up coach. Your goal is to help the user wake up gently and start their day positively. Keep responses brief and encouraging."
-                },
-                {
-                    "role": "user",
-                    "content": user_speech
-                }
-            ],
-            max_tokens=150  # Limit response length for voice
-        )
-        
-        ai_response = completion.choices[0].message.content
-        
         response = VoiceResponse()
-        response.say(ai_response)
         
-        # Add another gather for continued conversation
+        # Initial greeting
+        response.say("Good morning! Time to wake up. How are you feeling?")
+        
+        # Gather user's response
         gather = Gather(
             input='speech',
             action='/handle-response',
@@ -121,10 +171,83 @@ async def handle_response(request: Request):
         )
         response.append(gather)
         
-        return str(response)
+        # Return the response with the correct content type
+        logger.info("Returning TwiML response for voice call")
+        return Response(content=str(response), media_type="application/xml")
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"Error handling voice call: {str(e)}")
+        # Return a simple response in case of error
+        response = VoiceResponse()
+        response.say("I'm sorry, I encountered an error. Let's try again.")
+        return Response(content=str(response), media_type="application/xml")
+
+@app.post("/handle-response")
+async def handle_response(request: Request):
+    """Process user's response and generate AI response"""
+    try:
+        form_data = await request.form()
+        user_speech = form_data.get('SpeechResult', '')
+        logger.info(f"Received speech input: {user_speech}")
+        
+        # Generate AI response using OpenAI
+        try:
+            # Create a chat completion with the latest API
+            logger.info("Generating AI response using OpenAI")
+            completion = openai_client.chat.completions.create(
+                model="gpt-4",
+                messages=[
+                    {
+                        "role": "system",
+                        "content": "You are a supportive wake-up coach. Your goal is to help the user wake up gently and start their day positively. Keep responses brief and encouraging."
+                    },
+                    {
+                        "role": "user",
+                        "content": user_speech
+                    }
+                ],
+                max_tokens=150  # Limit response length for voice
+            )
+            
+            ai_response = completion.choices[0].message.content
+            logger.info(f"AI response generated: {ai_response}")
+            
+            response = VoiceResponse()
+            response.say(ai_response)
+            
+            # Add another gather for continued conversation
+            gather = Gather(
+                input='speech',
+                action='/handle-response',
+                method='POST',
+                language='en-US',
+                speechTimeout='auto'
+            )
+            response.append(gather)
+            
+            # Return the response with the correct content type
+            logger.info("Returning TwiML response for user input")
+            return Response(content=str(response), media_type="application/xml")
+        except Exception as e:
+            logger.error(f"Error generating AI response: {str(e)}")
+            # If there's an error, return a simple response
+            response = VoiceResponse()
+            response.say("I'm sorry, I encountered an error. Let's try again.")
+            gather = Gather(
+                input='speech',
+                action='/handle-response',
+                method='POST',
+                language='en-US',
+                speechTimeout='auto'
+            )
+            response.append(gather)
+            return Response(content=str(response), media_type="application/xml")
+    except Exception as e:
+        logger.error(f"Error handling user response: {str(e)}")
+        # Return a simple response in case of error
+        response = VoiceResponse()
+        response.say("I'm sorry, I encountered an error. Let's try again.")
+        return Response(content=str(response), media_type="application/xml")
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000) 
+    uvicorn.run(app, host="0.0.0.0", port=int(INTERNAL_PORT)) 
