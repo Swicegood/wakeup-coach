@@ -248,6 +248,42 @@ async def handle_response(request: Request):
         response.say("I'm sorry, I encountered an error. Let's try again.")
         return Response(content=str(response), media_type="application/xml")
 
+async def check_wake_up_time():
+    """Check if it's time for the wake-up call and make the call if needed"""
+    while True:
+        try:
+            # Get current time in the configured timezone
+            tz = pytz.timezone(os.getenv("TZ", "America/New_York"))
+            now = datetime.now(tz)
+            
+            # Parse wake-up time
+            wake_up_hour, wake_up_minute = map(int, WAKE_UP_TIME.split(":"))
+            
+            # Check if it's time for the wake-up call
+            if now.hour == wake_up_hour and now.minute == wake_up_minute:
+                logger.info(f"It's {WAKE_UP_TIME}! Making wake-up call to {PHONE_NUMBER}")
+                try:
+                    call = twilio_client.calls.create(
+                        to=PHONE_NUMBER,
+                        from_=TWILIO_PHONE_NUMBER,
+                        url=f"{BASE_URL}/voice"
+                    )
+                    logger.info(f"Wake-up call initiated with SID: {call.sid}")
+                except Exception as e:
+                    logger.error(f"Error making wake-up call: {str(e)}")
+            
+            # Sleep for 30 seconds before checking again
+            await asyncio.sleep(30)
+        except Exception as e:
+            logger.error(f"Error in wake-up time checker: {str(e)}")
+            await asyncio.sleep(30)
+
+@app.on_event("startup")
+async def startup_event():
+    """Start the wake-up time checker when the application starts"""
+    asyncio.create_task(check_wake_up_time())
+    logger.info("Wake-up time checker started")
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=int(INTERNAL_PORT)) 
