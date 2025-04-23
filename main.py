@@ -1,6 +1,7 @@
-from fastapi import FastAPI, HTTPException, Request, Response
+from fastapi import FastAPI, HTTPException, Request, Response, Depends
 from twilio.rest import Client
 from twilio.twiml.voice_response import VoiceResponse, Gather
+from twilio.request_validator import RequestValidator
 from openai import OpenAI
 import os
 from dotenv import load_dotenv
@@ -9,6 +10,8 @@ from datetime import datetime, timedelta
 import pytz
 from pydantic import BaseModel
 import logging
+from fastapi.security import HTTPBasic, HTTPBasicCredentials
+from typing import Optional
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -24,6 +27,9 @@ twilio_client = Client(
     os.getenv("TWILIO_ACCOUNT_SID"),
     os.getenv("TWILIO_AUTH_TOKEN")
 )
+
+# Initialize request validator
+validator = RequestValidator(os.getenv("TWILIO_AUTH_TOKEN"))
 
 # Initialize OpenAI client with the latest API version
 openai_client = OpenAI(
@@ -52,6 +58,31 @@ last_call_time = None  # Track when the last call was made
 
 class ScheduleRequest(BaseModel):
     minutes_from_now: int = 1
+
+async def validate_twilio_request(request: Request) -> bool:
+    """Validate that the request is coming from Twilio"""
+    try:
+        # Get the full URL
+        url = str(request.url)
+        
+        # Get the X-Twilio-Signature header
+        twilio_signature = request.headers.get('X-Twilio-Signature')
+        if not twilio_signature:
+            logger.warning("No X-Twilio-Signature header found")
+            return False
+            
+        # Get the request body
+        form_data = await request.form()
+        params = dict(form_data)
+        
+        # Validate the request
+        is_valid = validator.validate(url, params, twilio_signature)
+        if not is_valid:
+            logger.warning("Invalid Twilio signature")
+        return is_valid
+    except Exception as e:
+        logger.error(f"Error validating Twilio request: {str(e)}")
+        return False
 
 @app.get("/")
 async def root():
@@ -153,10 +184,14 @@ async def initiate_call():
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/voice")
-async def handle_call():
+async def handle_call(request: Request):
     """Handle the voice call and generate response"""
     logger.info("Handling incoming voice call")
     try:
+        # Validate the request is from Twilio
+        if not await validate_twilio_request(request):
+            raise HTTPException(status_code=403, detail="Invalid request signature")
+            
         response = VoiceResponse()
         
         # Initial greeting
@@ -190,6 +225,10 @@ async def handle_call():
 async def handle_response(request: Request):
     """Process user's response and generate AI response"""
     try:
+        # Validate the request is from Twilio
+        if not await validate_twilio_request(request):
+            raise HTTPException(status_code=403, detail="Invalid request signature")
+            
         form_data = await request.form()
         user_speech = form_data.get('SpeechResult', '')
         logger.info(f"Received speech input: {user_speech}")
@@ -260,8 +299,12 @@ async def handle_response(request: Request):
         return Response(content=str(response), media_type="application/xml")
 
 @app.post("/check-sleeping")
-async def check_sleeping():
+async def check_sleeping(request: Request):
     """Handle timeout by checking if user is sleeping"""
+    # Validate the request is from Twilio
+    if not await validate_twilio_request(request):
+        raise HTTPException(status_code=403, detail="Invalid request signature")
+        
     response = VoiceResponse()
     response.say("Are you sleeping?")
     
