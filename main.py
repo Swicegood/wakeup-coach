@@ -168,9 +168,13 @@ async def handle_call():
             action='/handle-response',
             method='POST',
             language='en-US',
-            speechTimeout='auto'
+            speechTimeout='auto',
+            timeout=5  # 5 seconds before timeout
         )
         response.append(gather)
+        
+        # Add a redirect for timeout
+        response.redirect('/check-sleeping')
         
         # Return the response with the correct content type
         logger.info("Returning TwiML response for voice call")
@@ -221,9 +225,13 @@ async def handle_response(request: Request):
                 action='/handle-response',
                 method='POST',
                 language='en-US',
-                speechTimeout='auto'
+                speechTimeout='auto',
+                timeout=5  # 5 seconds before timeout
             )
             response.append(gather)
+            
+            # Add a redirect for timeout
+            response.redirect('/check-sleeping')
             
             # Return the response with the correct content type
             logger.info("Returning TwiML response for user input")
@@ -238,9 +246,11 @@ async def handle_response(request: Request):
                 action='/handle-response',
                 method='POST',
                 language='en-US',
-                speechTimeout='auto'
+                speechTimeout='auto',
+                timeout=5  # 5 seconds before timeout
             )
             response.append(gather)
+            response.redirect('/check-sleeping')
             return Response(content=str(response), media_type="application/xml")
     except Exception as e:
         logger.error(f"Error handling user response: {str(e)}")
@@ -248,6 +258,25 @@ async def handle_response(request: Request):
         response = VoiceResponse()
         response.say("I'm sorry, I encountered an error. Let's try again.")
         return Response(content=str(response), media_type="application/xml")
+
+@app.post("/check-sleeping")
+async def check_sleeping():
+    """Handle timeout by checking if user is sleeping"""
+    response = VoiceResponse()
+    response.say("Are you sleeping?")
+    
+    # Gather response after sleep check
+    gather = Gather(
+        input='speech',
+        action='/handle-response',
+        method='POST',
+        language='en-US',
+        speechTimeout='auto',
+        timeout=5  # 5 seconds before timeout
+    )
+    response.append(gather)
+    
+    return Response(content=str(response), media_type="application/xml")
 
 async def check_wake_up_time():
     """Check if it's time for the wake-up call and make the call if needed"""
