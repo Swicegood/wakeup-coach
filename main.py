@@ -48,6 +48,7 @@ logger.info(f"BASE_URL={BASE_URL}")
 
 # Store scheduled tasks
 scheduled_tasks = {}
+last_call_time = None  # Track when the last call was made
 
 class ScheduleRequest(BaseModel):
     minutes_from_now: int = 1
@@ -250,6 +251,7 @@ async def handle_response(request: Request):
 
 async def check_wake_up_time():
     """Check if it's time for the wake-up call and make the call if needed"""
+    global last_call_time
     while True:
         try:
             # Get current time in the configured timezone
@@ -259,8 +261,9 @@ async def check_wake_up_time():
             # Parse wake-up time
             wake_up_hour, wake_up_minute = map(int, WAKE_UP_TIME.split(":"))
             
-            # Check if it's time for the wake-up call
-            if now.hour == wake_up_hour and now.minute == wake_up_minute:
+            # Check if it's time for the wake-up call and enough time has passed since last call
+            if (now.hour == wake_up_hour and now.minute == wake_up_minute and 
+                (last_call_time is None or (now - last_call_time).total_seconds() > 3600)):  # 1 hour cooldown
                 logger.info(f"It's {WAKE_UP_TIME}! Making wake-up call to {PHONE_NUMBER}")
                 try:
                     call = twilio_client.calls.create(
@@ -268,6 +271,7 @@ async def check_wake_up_time():
                         from_=TWILIO_PHONE_NUMBER,
                         url=f"{BASE_URL}/voice"
                     )
+                    last_call_time = now
                     logger.info(f"Wake-up call initiated with SID: {call.sid}")
                 except Exception as e:
                     logger.error(f"Error making wake-up call: {str(e)}")
