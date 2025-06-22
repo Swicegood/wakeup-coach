@@ -55,9 +55,16 @@ logger.info(f"BASE_URL={BASE_URL}")
 # Store scheduled tasks
 scheduled_tasks = {}
 last_call_time = None  # Track when the last call was made
+active_calls = {}  # Track active calls and their status
 
 class ScheduleRequest(BaseModel):
     minutes_from_now: int = 1
+
+class CallStatus(BaseModel):
+    CallSid: str
+    CallStatus: str
+    CallDuration: Optional[str] = None
+    SpeechResult: Optional[str] = None
 
 async def validate_twilio_request(request: Request) -> bool:
     """Validate that the request is coming from Twilio"""
@@ -96,9 +103,13 @@ async def test_call():
         call = twilio_client.calls.create(
             to=PHONE_NUMBER,
             from_=TWILIO_PHONE_NUMBER,
-            url=f"{BASE_URL}/voice"
+            url=f"{BASE_URL}/voice",
+            status_callback=f"{BASE_URL}/call-status",
+            status_callback_event=['initiated', 'ringing', 'answered', 'completed'],
+            status_callback_method='POST'
         )
         logger.info(f"Test call initiated with SID: {call.sid}")
+        active_calls[call.sid] = {"status": "initiated", "magic_words_spoken": False}
         return {"status": "Test call initiated", "call_sid": call.sid}
     except Exception as e:
         logger.error(f"Error initiating test call: {str(e)}")
@@ -126,9 +137,13 @@ async def schedule_test(request: ScheduleRequest):
                 call = twilio_client.calls.create(
                     to=PHONE_NUMBER,
                     from_=TWILIO_PHONE_NUMBER,
-                    url=f"{BASE_URL}/voice"
+                    url=f"{BASE_URL}/voice",
+                    status_callback=f"{BASE_URL}/call-status",
+                    status_callback_event=['initiated', 'ringing', 'answered', 'completed'],
+                    status_callback_method='POST'
                 )
                 logger.info(f"Scheduled test call made at {datetime.now()} with SID: {call.sid}")
+                active_calls[call.sid] = {"status": "initiated", "magic_words_spoken": False}
                 if task_id in scheduled_tasks:
                     del scheduled_tasks[task_id]
             except Exception as e:
@@ -175,13 +190,61 @@ async def initiate_call():
         call = twilio_client.calls.create(
             to=PHONE_NUMBER,
             from_=TWILIO_PHONE_NUMBER,
-            url=f"{BASE_URL}/voice"
+            url=f"{BASE_URL}/voice",
+            status_callback=f"{BASE_URL}/call-status",
+            status_callback_event=['initiated', 'ringing', 'answered', 'completed'],
+            status_callback_method='POST'
         )
         logger.info(f"Wake-up call initiated with SID: {call.sid}")
+        active_calls[call.sid] = {"status": "initiated", "magic_words_spoken": False}
         return {"status": "Call initiated", "call_sid": call.sid}
     except Exception as e:
         logger.error(f"Error initiating wake-up call: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/call-status")
+async def call_status(request: Request):
+    """Handle call status updates from Twilio"""
+    try:
+        # Validate the request is from Twilio
+        if not await validate_twilio_request(request):
+            raise HTTPException(status_code=403, detail="Invalid request signature")
+        
+        form_data = await request.form()
+        call_sid = form_data.get('CallSid')
+        call_status = form_data.get('CallStatus')
+        
+        logger.info(f"Call status update: {call_sid} - {call_status}")
+        
+        # Update call status in our tracking
+        if call_sid in active_calls:
+            active_calls[call_sid]["status"] = call_status
+        else:
+            active_calls[call_sid] = {"status": call_status, "magic_words_spoken": False}
+        
+        # If call is completed and magic words weren't spoken, call back
+        if call_status == "completed" and call_sid in active_calls and not active_calls[call_sid].get("magic_words_spoken", False):
+            logger.info(f"Call {call_sid} ended without magic words. Calling back...")
+            # Wait a short time before calling back
+            await asyncio.sleep(5)
+            try:
+                new_call = twilio_client.calls.create(
+                    to=PHONE_NUMBER,
+                    from_=TWILIO_PHONE_NUMBER,
+                    url=f"{BASE_URL}/voice",
+                    status_callback=f"{BASE_URL}/call-status",
+                    status_callback_event=['initiated', 'ringing', 'answered', 'completed'],
+                    status_callback_method='POST'
+                )
+                logger.info(f"Call back initiated with SID: {new_call.sid}")
+                active_calls[new_call.sid] = {"status": "initiated", "magic_words_spoken": False}
+            except Exception as e:
+                logger.error(f"Error calling back: {str(e)}")
+        
+        return {"status": "ok"}
+    except Exception as e:
+        logger.error(f"Error handling call status: {str(e)}")
+        return {"status": "error", "message": str(e)}
 
 @app.post("/voice")
 async def handle_call(request: Request):
@@ -230,8 +293,19 @@ async def handle_response(request: Request):
             raise HTTPException(status_code=403, detail="Invalid request signature")
             
         form_data = await request.form()
-        user_speech = form_data.get('SpeechResult', '')
+        user_speech = form_data.get('SpeechResult', '').lower()
+        call_sid = form_data.get('CallSid')
         logger.info(f"Received speech input: {user_speech}")
+        
+        # Check if user wants to end the call with magic words
+        if "goodbye" in user_speech or "end call" in user_speech:
+            # Mark that magic words were spoken
+            if call_sid in active_calls:
+                active_calls[call_sid]["magic_words_spoken"] = True
+            
+            response = VoiceResponse()
+            response.say("Goodbye! Have a great day!")
+            return Response(content=str(response), media_type="application/xml")
         
         # Generate AI response using OpenAI
         try:
@@ -242,7 +316,7 @@ async def handle_response(request: Request):
                 messages=[
                     {
                         "role": "system",
-                        "content": "You are a supportive wake-up coach. Your goal is to help the user wake up gently and start their day positively. Keep responses brief and encouraging."
+                        "content": "You are a supportive wake-up coach. Your goal is to help the user wake up gently and start their day positively. Keep responses brief and encouraging. If the user seems sleepy, try to engage them more actively."
                     },
                     {
                         "role": "user",
@@ -341,10 +415,14 @@ async def check_wake_up_time():
                     call = twilio_client.calls.create(
                         to=PHONE_NUMBER,
                         from_=TWILIO_PHONE_NUMBER,
-                        url=f"{BASE_URL}/voice"
+                        url=f"{BASE_URL}/voice",
+                        status_callback=f"{BASE_URL}/call-status",
+                        status_callback_event=['initiated', 'ringing', 'answered', 'completed'],
+                        status_callback_method='POST'
                     )
                     last_call_time = now
                     logger.info(f"Wake-up call initiated with SID: {call.sid}")
+                    active_calls[call.sid] = {"status": "initiated", "magic_words_spoken": False}
                 except Exception as e:
                     logger.error(f"Error making wake-up call: {str(e)}")
             
