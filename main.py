@@ -12,6 +12,7 @@ from pydantic import BaseModel
 import logging
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from typing import Optional
+import json
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -47,15 +48,22 @@ INTERNAL_PORT = os.getenv("PORT", "8000")
 EXTERNAL_PORT = os.getenv("EXTERNAL_PORT", "8765")
 SERVER_IP = os.getenv("SERVER_IP", "YOUR_SERVER_IP")  # Your server's IP address
 BASE_URL = os.getenv("BASE_URL", f"http://{SERVER_IP}:{EXTERNAL_PORT}")
+DOORBELL_ACTIVATION_TIMEOUT = int(os.getenv("DOORBELL_ACTIVATION_TIMEOUT", "300"))  # 5 minutes default
 
 # Log configuration
 logger.info(f"Configuration loaded: WAKE_UP_TIME={WAKE_UP_TIME}, PHONE_NUMBER={PHONE_NUMBER}, TWILIO_PHONE_NUMBER={TWILIO_PHONE_NUMBER}")
 logger.info(f"BASE_URL={BASE_URL}")
+logger.info(f"DOORBELL_ACTIVATION_TIMEOUT={DOORBELL_ACTIVATION_TIMEOUT} seconds")
 
 # Store scheduled tasks
 scheduled_tasks = {}
 last_call_time = None  # Track when the last call was made
 active_calls = {}  # Track active calls and their status
+
+# Doorbell activation state
+doorbell_activated = False
+doorbell_activation_time = None
+doorbell_timeout_task = None
 
 class ScheduleRequest(BaseModel):
     minutes_from_now: int = 1
@@ -65,6 +73,13 @@ class CallStatus(BaseModel):
     CallStatus: str
     CallDuration: Optional[str] = None
     SpeechResult: Optional[str] = None
+
+class DoorbellWebhook(BaseModel):
+    """Model for UniFi Protect doorbell webhook data"""
+    event_type: Optional[str] = None
+    device_id: Optional[str] = None
+    timestamp: Optional[str] = None
+    # Add other fields as needed based on UniFi Protect webhook format
 
 async def validate_twilio_request(request: Request) -> bool:
     """Validate that the request is coming from Twilio"""
@@ -91,9 +106,111 @@ async def validate_twilio_request(request: Request) -> bool:
         logger.error(f"Error validating Twilio request: {str(e)}")
         return False
 
+async def reset_doorbell_activation():
+    """Reset doorbell activation after timeout"""
+    global doorbell_activated, doorbell_activation_time, doorbell_timeout_task
+    await asyncio.sleep(DOORBELL_ACTIVATION_TIMEOUT)
+    doorbell_activated = False
+    doorbell_activation_time = None
+    doorbell_timeout_task = None
+    logger.info("Doorbell activation timed out - magic words are now disabled")
+
+def activate_doorbell():
+    """Activate doorbell and start timeout timer"""
+    global doorbell_activated, doorbell_activation_time, doorbell_timeout_task
+    
+    # Cancel existing timeout task if any
+    if doorbell_timeout_task and not doorbell_timeout_task.done():
+        doorbell_timeout_task.cancel()
+    
+    doorbell_activated = True
+    doorbell_activation_time = datetime.now()
+    doorbell_timeout_task = asyncio.create_task(reset_doorbell_activation())
+    logger.info(f"Doorbell activated at {doorbell_activation_time.strftime('%Y-%m-%d %H:%M:%S')} - magic words are now enabled for {DOORBELL_ACTIVATION_TIMEOUT} seconds")
+
+@app.post("/doorbell-webhook")
+async def doorbell_webhook(request: Request):
+    """Handle webhook from UniFi Protect doorbell"""
+    try:
+        # Get the request body
+        body = await request.body()
+        data = json.loads(body) if body else {}
+        
+        logger.info(f"Received doorbell webhook: {data}")
+        
+        # Check if this is a fingerprint authentication event
+        # You'll need to adjust this based on the actual UniFi Protect webhook format
+        event_type = data.get('event_type', '').lower()
+        device_id = data.get('device_id', '')
+        
+        # Common UniFi Protect event types for doorbell authentication
+        fingerprint_events = [
+            'doorbell.fingerprint.authenticated',
+            'doorbell.fingerprint.success',
+            'doorbell.auth.success',
+            'fingerprint.authenticated',
+            'auth.success'
+        ]
+        
+        if any(event in event_type for event in fingerprint_events):
+            logger.info(f"Fingerprint authentication detected on device {device_id}")
+            activate_doorbell()
+            return {"status": "success", "message": "Doorbell activated"}
+        else:
+            logger.info(f"Non-fingerprint event received: {event_type}")
+            return {"status": "ignored", "message": "Not a fingerprint event"}
+            
+    except Exception as e:
+        logger.error(f"Error processing doorbell webhook: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/doorbell-status")
+async def doorbell_status():
+    """Get current doorbell activation status"""
+    global doorbell_activated, doorbell_activation_time
+    
+    if doorbell_activated and doorbell_activation_time:
+        time_remaining = DOORBELL_ACTIVATION_TIMEOUT - (datetime.now() - doorbell_activation_time).total_seconds()
+        time_remaining = max(0, time_remaining)
+        return {
+            "activated": doorbell_activated,
+            "activation_time": doorbell_activation_time.strftime("%Y-%m-%d %H:%M:%S"),
+            "time_remaining_seconds": int(time_remaining),
+            "timeout_seconds": DOORBELL_ACTIVATION_TIMEOUT
+        }
+    else:
+        return {
+            "activated": False,
+            "activation_time": None,
+            "time_remaining_seconds": 0,
+            "timeout_seconds": DOORBELL_ACTIVATION_TIMEOUT
+        }
+
 @app.get("/")
 async def root():
-    return {"status": "Wake-up Coach is running"}
+    global doorbell_activated, doorbell_activation_time
+    
+    status_info = {
+        "status": "Wake-up Coach is running",
+        "doorbell_activated": doorbell_activated,
+        "doorbell_timeout_seconds": DOORBELL_ACTIVATION_TIMEOUT
+    }
+    
+    if doorbell_activated and doorbell_activation_time:
+        time_remaining = DOORBELL_ACTIVATION_TIMEOUT - (datetime.now() - doorbell_activation_time).total_seconds()
+        time_remaining = max(0, time_remaining)
+        status_info.update({
+            "activation_time": doorbell_activation_time.strftime("%Y-%m-%d %H:%M:%S"),
+            "time_remaining_seconds": int(time_remaining)
+        })
+    
+    return status_info
+
+@app.post("/activate-doorbell")
+async def manual_activate_doorbell():
+    """Manually activate doorbell for testing purposes"""
+    activate_doorbell()
+    return {"status": "success", "message": "Doorbell manually activated"}
 
 @app.get("/test-call")
 async def test_call():
@@ -299,24 +416,51 @@ async def handle_response(request: Request):
         
         # Check if user wants to end the call with magic words
         if "goodbye" in user_speech or "end call" in user_speech:
-            # Mark that magic words were spoken
-            if call_sid in active_calls:
-                active_calls[call_sid]["magic_words_spoken"] = True
-            
-            response = VoiceResponse()
-            response.say("Goodbye! Have a great day!")
-            return Response(content=str(response), media_type="application/xml")
+            # Check if doorbell has been activated
+            if not doorbell_activated:
+                logger.info("Magic words spoken but doorbell not activated - ignoring")
+                response = VoiceResponse()
+                response.say("I heard you say goodbye, but you need to get out of bed and touch your doorbell first. Come on, you can do it!")
+                
+                # Add another gather for continued conversation
+                gather = Gather(
+                    input='speech',
+                    action='/handle-response',
+                    method='POST',
+                    language='en-US',
+                    speechTimeout='auto',
+                    timeout=5  # 5 seconds before timeout
+                )
+                response.append(gather)
+                response.redirect('/check-sleeping')
+                return Response(content=str(response), media_type="application/xml")
+            else:
+                # Doorbell is activated, allow magic words to work
+                logger.info("Magic words spoken with doorbell activated - ending call")
+                if call_sid in active_calls:
+                    active_calls[call_sid]["magic_words_spoken"] = True
+                
+                response = VoiceResponse()
+                response.say("Great job getting out of bed! Goodbye and have a wonderful day!")
+                return Response(content=str(response), media_type="application/xml")
         
         # Generate AI response using OpenAI
         try:
             # Create a chat completion with the latest API
             logger.info("Generating AI response using OpenAI")
+            
+            # Add doorbell context to the AI response
+            system_message = "You are a supportive wake-up coach. Your goal is to help the user wake up gently and start their day positively. Keep responses brief and encouraging. If the user seems sleepy, try to engage them more actively."
+            
+            if not doorbell_activated:
+                system_message += " IMPORTANT: The user must physically get out of bed and touch their doorbell fingerprint reader before they can end the call with magic words. Encourage them to do this if they mention wanting to end the call."
+            
             completion = openai_client.chat.completions.create(
                 model="gpt-4",
                 messages=[
                     {
                         "role": "system",
-                        "content": "You are a supportive wake-up coach. Your goal is to help the user wake up gently and start their day positively. Keep responses brief and encouraging. If the user seems sleepy, try to engage them more actively."
+                        "content": system_message
                     },
                     {
                         "role": "user",
