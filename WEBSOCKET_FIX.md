@@ -11,7 +11,7 @@ You're using **macvlan networking** in Docker, which can interfere with WebSocke
 ### Step 1: Check if WebSocket endpoints are registered
 
 ```bash
-curl http://YOUR_DOMAIN:8765/websocket-status
+curl http://YOUR_DOMAIN_OR_IP:8765/websocket-status
 ```
 
 This should show all registered routes including WebSocket ones.
@@ -36,7 +36,7 @@ python test_websocket.py
 npm install -g wscat
 
 # Test connection
-wscat -c ws://YOUR_DOMAIN:8765/test-websocket
+wscat -c ws://YOUR_DOMAIN_OR_IP:8765/test-websocket
 ```
 
 Expected output:
@@ -132,7 +132,7 @@ If WebSocket test works locally but not externally:
 3. **Test from external network:**
    ```bash
    # From your phone or another network
-   wscat -c ws://YOUR_DOMAIN:8765/test-websocket
+   wscat -c ws://YOUR_DOMAIN_OR_IP:8765/test-websocket
    ```
 
 ### Issue 4: Reverse Proxy (if using Nginx/Apache)
@@ -173,7 +173,7 @@ server {
 While debugging WebSocket issues, **disable Realtime API** to keep your wake-up coach working:
 
 ```bash
-curl -X POST "http://YOUR_DOMAIN:8765/realtime-api-config?probability=0.0"
+curl -X POST "http://YOUR_DOMAIN_OR_IP:8765/realtime-api-config?probability=0.0"
 ```
 
 This will use only the Traditional API (which works perfectly).
@@ -189,13 +189,13 @@ This will use only the Traditional API (which works perfectly).
 
 2. **Test WebSocket:**
    ```bash
-   wscat -c ws://YOUR_DOMAIN:8765/test-websocket
+   wscat -c ws://YOUR_DOMAIN_OR_IP:8765/test-websocket
    # Should connect and show: {"status":"connected",...}
    ```
 
 3. **Test Realtime API call:**
    ```bash
-   curl http://YOUR_DOMAIN:8765/test-call-realtime
+   curl http://YOUR_DOMAIN_OR_IP:8765/test-call-realtime
    ```
 
 4. **Watch logs for:**
@@ -209,7 +209,7 @@ This will use only the Traditional API (which works perfectly).
 
 ```
 INFO - Handling incoming voice call with Realtime API
-INFO - Creating Media Stream with URL: ws://YOUR_DOMAIN:8765/media-stream
+INFO - Creating Media Stream with URL: ws://YOUR_DOMAIN_OR_IP:8765/media-stream
 INFO - TwiML: <Response><Say>...
 INFO - Media Stream WebSocket connection accepted from Twilio  ← THIS IS MISSING
 INFO - Attempting to connect to OpenAI Realtime API...

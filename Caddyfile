@@ -1,0 +1,28 @@
+# Caddy configuration for Wake-up Coach with automatic HTTPS
+# Replace YOUR_DOMAIN with your actual domain
+
+YOUR_DOMAIN {
+    # Automatic HTTPS with Let's Encrypt
+    # Caddy will automatically obtain and renew SSL certificates
+    
+    # Reverse proxy all requests to the FastAPI app
+    reverse_proxy wakeup-coach:8000 {
+        # WebSocket support
+        header_up Upgrade {http.request.header.Upgrade}
+        header_up Connection {http.request.header.Connection}
+        header_up Host {http.request.host}
+        header_up X-Real-IP {http.request.remote.host}
+        header_up X-Forwarded-For {http.request.remote.host}
+        header_up X-Forwarded-Proto {http.request.scheme}
+    }
+    
+    # Enable access logs
+    log {
+        output file /var/log/caddy/access.log
+        format console
+    }
+}
+
+# Optional: Redirect HTTP to HTTPS (Caddy does this automatically)
+# But you can customize if needed
+

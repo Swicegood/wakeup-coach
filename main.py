@@ -542,11 +542,13 @@ async def handle_call_realtime(request: Request):
         response.say("Good morning! Connecting you to your wake-up coach.")
         
         # Connect to Media Stream
+        # Twilio Media Streams may require the actual domain name, not IP
         # Use wss:// for WebSocket Secure if your server supports it, otherwise ws://
         ws_url = BASE_URL.replace("http://", "ws://").replace("https://", "wss://")
         stream_url = f"{ws_url}/media-stream"
         
         logger.info(f"Creating Media Stream with URL: {stream_url}")
+        logger.info(f"BASE_URL is: {BASE_URL}")
         
         connect = Connect()
         stream = Stream(url=stream_url)
@@ -569,11 +571,19 @@ async def handle_call_realtime(request: Request):
 @app.websocket("/media-stream")
 async def media_stream(websocket: WebSocket):
     """Handle Twilio Media Streams WebSocket connection and bridge to OpenAI Realtime API"""
+    logger.info("=" * 80)
+    logger.info("MEDIA STREAM WEBSOCKET ENDPOINT HIT!")
+    logger.info(f"Client: {websocket.client}")
+    logger.info(f"Headers: {websocket.headers}")
+    logger.info("=" * 80)
+    
     try:
+        logger.info("Attempting to accept WebSocket connection...")
         await websocket.accept()
-        logger.info("Media Stream WebSocket connection accepted from Twilio")
+        logger.info("✓✓✓ Media Stream WebSocket connection ACCEPTED from Twilio ✓✓✓")
     except Exception as e:
-        logger.error(f"Failed to accept WebSocket connection: {str(e)}")
+        logger.error(f"✗✗✗ Failed to accept WebSocket connection: {str(e)}")
+        logger.error(f"Error type: {type(e).__name__}", exc_info=True)
         return
     
     openai_ws = None

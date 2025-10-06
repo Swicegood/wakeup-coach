@@ -46,10 +46,10 @@ PHONE_NUMBER=+1234567890
 WAKE_UP_TIME=06:00
 
 # Server Configuration
-SERVER_IP=YOUR_SERVER_IP
+SERVER_IP=your_server_ip_here
 EXTERNAL_PORT=8765
 PORT=8000
-BASE_URL=http://YOUR_SERVER_IP:8765
+BASE_URL=http://your_server_ip_or_domain:8765
 
 # Timezone Configuration
 TZ=America/New_York

@@ -1,0 +1,46 @@
+version: '3.8'
+
+services:
+  wakeup-coach:
+    build: .
+    container_name: wakeup-coach
+    restart: unless-stopped
+    # No direct port exposure - Caddy will proxy
+    networks:
+      - wakeup_network
+    volumes:
+      - ./config:/app/config
+    env_file:
+      - .env
+    environment:
+      - TZ=America/New_York
+      - PORT=8000  # Internal port
+      - EXTERNAL_PORT=443  # External HTTPS port
+      # BASE_URL will be set in .env to https://YOUR_DOMAIN
+
+  caddy:
+    image: caddy:latest
+    container_name: wakeup-coach-caddy
+    restart: unless-stopped
+    ports:
+      - "80:80"    # HTTP (for Let's Encrypt verification)
+      - "443:443"  # HTTPS
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile
+      - caddy_data:/data
+      - caddy_config:/config
+    networks:
+      - wakeup_network
+    depends_on:
+      - wakeup-coach
+
+networks:
+  wakeup_network:
+    driver: bridge
+
+volumes:
+  caddy_data:
+    driver: local
+  caddy_config:
+    driver: local
+

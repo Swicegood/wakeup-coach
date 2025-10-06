@@ -81,7 +81,7 @@ async def main():
     print("=" * 60)
     local_result = await test_websocket_connection(local_url)
     
-    # Test external connection
+    # Test external connection - REPLACE WITH YOUR DOMAIN
     external_url = "ws://YOUR_DOMAIN:8765/test-websocket"
     print("\n" + "=" * 60)
     print("Test 2: External connection (as Twilio would see it)")
