@@ -255,6 +255,26 @@ async def manual_activate_doorbell():
     activate_doorbell()
     return {"status": "success", "message": "Doorbell manually activated"}
 
+@app.websocket("/test-websocket")
+async def test_websocket(websocket: WebSocket):
+    """Test WebSocket connectivity"""
+    try:
+        await websocket.accept()
+        logger.info("Test WebSocket connection accepted")
+        await websocket.send_json({"status": "connected", "message": "WebSocket is working!"})
+        
+        # Echo back any messages received
+        while True:
+            try:
+                data = await websocket.receive_text()
+                logger.info(f"Received test message: {data}")
+                await websocket.send_json({"echo": data, "timestamp": datetime.now().isoformat()})
+            except WebSocketDisconnect:
+                logger.info("Test WebSocket disconnected")
+                break
+    except Exception as e:
+        logger.error(f"Error in test WebSocket: {str(e)}", exc_info=True)
+
 @app.get("/test-call")
 async def test_call():
     """Test endpoint to initiate a call immediately"""
@@ -274,6 +294,48 @@ async def test_call():
         return {"status": "Test call initiated", "call_sid": call.sid, "using_realtime_api": voice_endpoint == "/voice-realtime"}
     except Exception as e:
         logger.error(f"Error initiating test call: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/test-call-realtime")
+async def test_call_realtime():
+    """Test endpoint to force a Realtime API call"""
+    try:
+        voice_endpoint = "/voice-realtime"
+        logger.info(f"Initiating FORCED Realtime API test call to {PHONE_NUMBER} from {TWILIO_PHONE_NUMBER}")
+        call = twilio_client.calls.create(
+            to=PHONE_NUMBER,
+            from_=TWILIO_PHONE_NUMBER,
+            url=f"{BASE_URL}{voice_endpoint}",
+            status_callback=f"{BASE_URL}/call-status",
+            status_callback_event=['initiated', 'ringing', 'answered', 'completed'],
+            status_callback_method='POST'
+        )
+        logger.info(f"Realtime API test call initiated with SID: {call.sid}")
+        active_calls[call.sid] = {"status": "initiated", "magic_words_spoken": False, "endpoint": voice_endpoint}
+        return {"status": "Realtime API test call initiated", "call_sid": call.sid, "using_realtime_api": True}
+    except Exception as e:
+        logger.error(f"Error initiating Realtime API test call: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/test-call-traditional")
+async def test_call_traditional():
+    """Test endpoint to force a Traditional API call"""
+    try:
+        voice_endpoint = "/voice"
+        logger.info(f"Initiating FORCED Traditional API test call to {PHONE_NUMBER} from {TWILIO_PHONE_NUMBER}")
+        call = twilio_client.calls.create(
+            to=PHONE_NUMBER,
+            from_=TWILIO_PHONE_NUMBER,
+            url=f"{BASE_URL}{voice_endpoint}",
+            status_callback=f"{BASE_URL}/call-status",
+            status_callback_event=['initiated', 'ringing', 'answered', 'completed'],
+            status_callback_method='POST'
+        )
+        logger.info(f"Traditional API test call initiated with SID: {call.sid}")
+        active_calls[call.sid] = {"status": "initiated", "magic_words_spoken": False, "endpoint": voice_endpoint}
+        return {"status": "Traditional API test call initiated", "call_sid": call.sid, "using_realtime_api": False}
+    except Exception as e:
+        logger.error(f"Error initiating Traditional API test call: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/schedule-test")
@@ -464,15 +526,22 @@ async def handle_call_realtime(request: Request):
         response.say("Good morning! Connecting you to your wake-up coach.")
         
         # Connect to Media Stream
-        connect = Connect()
         # Use wss:// for WebSocket Secure if your server supports it, otherwise ws://
         ws_url = BASE_URL.replace("http://", "ws://").replace("https://", "wss://")
-        connect.stream(url=f"{ws_url}/media-stream")
+        stream_url = f"{ws_url}/media-stream"
+        
+        logger.info(f"Creating Media Stream with URL: {stream_url}")
+        
+        connect = Connect()
+        stream = Stream(url=stream_url)
+        connect.append(stream)
         response.append(connect)
         
         # Return the response with the correct content type
         logger.info("Returning TwiML response for Realtime API voice call")
-        return Response(content=str(response), media_type="application/xml")
+        twiml_str = str(response)
+        logger.info(f"TwiML: {twiml_str}")
+        return Response(content=twiml_str, media_type="application/xml")
     except Exception as e:
         logger.error(f"Error handling Realtime API voice call: {str(e)}")
         # Fallback to regular voice endpoint
@@ -484,14 +553,19 @@ async def handle_call_realtime(request: Request):
 @app.websocket("/media-stream")
 async def media_stream(websocket: WebSocket):
     """Handle Twilio Media Streams WebSocket connection and bridge to OpenAI Realtime API"""
-    await websocket.accept()
-    logger.info("Media Stream WebSocket connection established")
+    try:
+        await websocket.accept()
+        logger.info("Media Stream WebSocket connection accepted from Twilio")
+    except Exception as e:
+        logger.error(f"Failed to accept WebSocket connection: {str(e)}")
+        return
     
     openai_ws = None
     stream_sid = None
     call_sid = None
     
     try:
+        logger.info("Attempting to connect to OpenAI Realtime API...")
         # Connect to OpenAI Realtime API
         openai_ws = await websockets.connect(
             'wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2024-10-01',
@@ -632,11 +706,28 @@ async def media_stream(websocket: WebSocket):
         )
         
     except Exception as e:
-        logger.error(f"Error in media stream: {str(e)}")
+        logger.error(f"Error in media stream: {str(e)}", exc_info=True)
+        # Try to send error to Twilio
+        try:
+            await websocket.send_json({
+                "event": "stop",
+                "streamSid": stream_sid
+            })
+        except:
+            pass
     finally:
         if openai_ws:
-            await openai_ws.close()
-        logger.info("Media Stream WebSocket connection closed")
+            try:
+                await openai_ws.close()
+                logger.info("OpenAI WebSocket closed")
+            except:
+                pass
+        try:
+            await websocket.close()
+            logger.info("Twilio WebSocket closed")
+        except:
+            pass
+        logger.info("Media Stream WebSocket connection fully closed")
 
 @app.post("/handle-response")
 async def handle_response(request: Request):
