@@ -1,6 +1,6 @@
-from fastapi import FastAPI, HTTPException, Request, Response, Depends
+from fastapi import FastAPI, HTTPException, Request, Response, Depends, WebSocket, WebSocketDisconnect
 from twilio.rest import Client
-from twilio.twiml.voice_response import VoiceResponse, Gather
+from twilio.twiml.voice_response import VoiceResponse, Gather, Connect, Stream
 from twilio.request_validator import RequestValidator
 from openai import OpenAI
 import os
@@ -13,6 +13,9 @@ import logging
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from typing import Optional
 import json
+import websockets
+import base64
+import random
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -49,11 +52,13 @@ EXTERNAL_PORT = os.getenv("EXTERNAL_PORT", "8765")
 SERVER_IP = os.getenv("SERVER_IP", "YOUR_SERVER_IP")  # Your server's IP address
 BASE_URL = os.getenv("BASE_URL", f"http://{SERVER_IP}:{EXTERNAL_PORT}")
 DOORBELL_ACTIVATION_TIMEOUT = int(os.getenv("DOORBELL_ACTIVATION_TIMEOUT", "300"))  # 5 minutes default
+REALTIME_API_PROBABILITY = float(os.getenv("REALTIME_API_PROBABILITY", "0.5"))  # 50% chance by default
 
 # Log configuration
 logger.info(f"Configuration loaded: WAKE_UP_TIME={WAKE_UP_TIME}, PHONE_NUMBER={PHONE_NUMBER}, TWILIO_PHONE_NUMBER={TWILIO_PHONE_NUMBER}")
 logger.info(f"BASE_URL={BASE_URL}")
 logger.info(f"DOORBELL_ACTIVATION_TIMEOUT={DOORBELL_ACTIVATION_TIMEOUT} seconds")
+logger.info(f"REALTIME_API_PROBABILITY={REALTIME_API_PROBABILITY} ({REALTIME_API_PROBABILITY*100}% chance)")
 
 # Store scheduled tasks
 scheduled_tasks = {}
@@ -80,6 +85,16 @@ class DoorbellWebhook(BaseModel):
     device_id: Optional[str] = None
     timestamp: Optional[str] = None
     # Add other fields as needed based on UniFi Protect webhook format
+
+def should_use_realtime_api() -> bool:
+    """Randomly decide whether to use Realtime API based on configured probability"""
+    use_realtime = random.random() < REALTIME_API_PROBABILITY
+    logger.info(f"Call routing decision: {'Realtime API' if use_realtime else 'Traditional API'}")
+    return use_realtime
+
+def get_voice_endpoint() -> str:
+    """Get the appropriate voice endpoint based on random selection"""
+    return "/voice-realtime" if should_use_realtime_api() else "/voice"
 
 async def validate_twilio_request(request: Request) -> bool:
     """Validate that the request is coming from Twilio"""
@@ -164,6 +179,32 @@ async def doorbell_webhook(request: Request):
         logger.error(f"Error processing doorbell webhook: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
+@app.get("/realtime-api-config")
+async def get_realtime_api_config():
+    """Get current Realtime API configuration"""
+    return {
+        "probability": REALTIME_API_PROBABILITY,
+        "percentage": f"{REALTIME_API_PROBABILITY * 100}%",
+        "description": "Probability of using OpenAI Realtime API vs Traditional API"
+    }
+
+@app.post("/realtime-api-config")
+async def update_realtime_api_config(probability: float):
+    """Update Realtime API probability (0.0 to 1.0)"""
+    global REALTIME_API_PROBABILITY
+    
+    if not 0.0 <= probability <= 1.0:
+        raise HTTPException(status_code=400, detail="Probability must be between 0.0 and 1.0")
+    
+    REALTIME_API_PROBABILITY = probability
+    logger.info(f"Realtime API probability updated to {REALTIME_API_PROBABILITY} ({REALTIME_API_PROBABILITY*100}%)")
+    
+    return {
+        "status": "updated",
+        "probability": REALTIME_API_PROBABILITY,
+        "percentage": f"{REALTIME_API_PROBABILITY * 100}%"
+    }
+
 @app.get("/doorbell-status")
 async def doorbell_status():
     """Get current doorbell activation status"""
@@ -193,7 +234,9 @@ async def root():
     status_info = {
         "status": "Wake-up Coach is running",
         "doorbell_activated": doorbell_activated,
-        "doorbell_timeout_seconds": DOORBELL_ACTIVATION_TIMEOUT
+        "doorbell_timeout_seconds": DOORBELL_ACTIVATION_TIMEOUT,
+        "realtime_api_probability": REALTIME_API_PROBABILITY,
+        "realtime_api_percentage": f"{REALTIME_API_PROBABILITY * 100}%"
     }
     
     if doorbell_activated and doorbell_activation_time:
@@ -216,18 +259,19 @@ async def manual_activate_doorbell():
 async def test_call():
     """Test endpoint to initiate a call immediately"""
     try:
-        logger.info(f"Initiating test call to {PHONE_NUMBER} from {TWILIO_PHONE_NUMBER}")
+        voice_endpoint = get_voice_endpoint()
+        logger.info(f"Initiating test call to {PHONE_NUMBER} from {TWILIO_PHONE_NUMBER} using {voice_endpoint}")
         call = twilio_client.calls.create(
             to=PHONE_NUMBER,
             from_=TWILIO_PHONE_NUMBER,
-            url=f"{BASE_URL}/voice",
+            url=f"{BASE_URL}{voice_endpoint}",
             status_callback=f"{BASE_URL}/call-status",
             status_callback_event=['initiated', 'ringing', 'answered', 'completed'],
             status_callback_method='POST'
         )
         logger.info(f"Test call initiated with SID: {call.sid}")
-        active_calls[call.sid] = {"status": "initiated", "magic_words_spoken": False}
-        return {"status": "Test call initiated", "call_sid": call.sid}
+        active_calls[call.sid] = {"status": "initiated", "magic_words_spoken": False, "endpoint": voice_endpoint}
+        return {"status": "Test call initiated", "call_sid": call.sid, "using_realtime_api": voice_endpoint == "/voice-realtime"}
     except Exception as e:
         logger.error(f"Error initiating test call: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -250,17 +294,18 @@ async def schedule_test(request: ScheduleRequest):
         async def delayed_call():
             await asyncio.sleep(minutes * 60)  # Convert minutes to seconds
             try:
-                logger.info(f"Making scheduled call to {PHONE_NUMBER} from {TWILIO_PHONE_NUMBER}")
+                voice_endpoint = get_voice_endpoint()
+                logger.info(f"Making scheduled call to {PHONE_NUMBER} from {TWILIO_PHONE_NUMBER} using {voice_endpoint}")
                 call = twilio_client.calls.create(
                     to=PHONE_NUMBER,
                     from_=TWILIO_PHONE_NUMBER,
-                    url=f"{BASE_URL}/voice",
+                    url=f"{BASE_URL}{voice_endpoint}",
                     status_callback=f"{BASE_URL}/call-status",
                     status_callback_event=['initiated', 'ringing', 'answered', 'completed'],
                     status_callback_method='POST'
                 )
                 logger.info(f"Scheduled test call made at {datetime.now()} with SID: {call.sid}")
-                active_calls[call.sid] = {"status": "initiated", "magic_words_spoken": False}
+                active_calls[call.sid] = {"status": "initiated", "magic_words_spoken": False, "endpoint": voice_endpoint}
                 if task_id in scheduled_tasks:
                     del scheduled_tasks[task_id]
             except Exception as e:
@@ -303,18 +348,19 @@ async def list_scheduled():
 async def initiate_call():
     """Initiate a wake-up call"""
     try:
-        logger.info(f"Initiating wake-up call to {PHONE_NUMBER} from {TWILIO_PHONE_NUMBER}")
+        voice_endpoint = get_voice_endpoint()
+        logger.info(f"Initiating wake-up call to {PHONE_NUMBER} from {TWILIO_PHONE_NUMBER} using {voice_endpoint}")
         call = twilio_client.calls.create(
             to=PHONE_NUMBER,
             from_=TWILIO_PHONE_NUMBER,
-            url=f"{BASE_URL}/voice",
+            url=f"{BASE_URL}{voice_endpoint}",
             status_callback=f"{BASE_URL}/call-status",
             status_callback_event=['initiated', 'ringing', 'answered', 'completed'],
             status_callback_method='POST'
         )
         logger.info(f"Wake-up call initiated with SID: {call.sid}")
-        active_calls[call.sid] = {"status": "initiated", "magic_words_spoken": False}
-        return {"status": "Call initiated", "call_sid": call.sid}
+        active_calls[call.sid] = {"status": "initiated", "magic_words_spoken": False, "endpoint": voice_endpoint}
+        return {"status": "Call initiated", "call_sid": call.sid, "using_realtime_api": voice_endpoint == "/voice-realtime"}
     except Exception as e:
         logger.error(f"Error initiating wake-up call: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -345,16 +391,18 @@ async def call_status(request: Request):
             # Wait a short time before calling back
             await asyncio.sleep(5)
             try:
+                voice_endpoint = get_voice_endpoint()
+                logger.info(f"Calling back using {voice_endpoint}")
                 new_call = twilio_client.calls.create(
                     to=PHONE_NUMBER,
                     from_=TWILIO_PHONE_NUMBER,
-                    url=f"{BASE_URL}/voice",
+                    url=f"{BASE_URL}{voice_endpoint}",
                     status_callback=f"{BASE_URL}/call-status",
                     status_callback_event=['initiated', 'ringing', 'answered', 'completed'],
                     status_callback_method='POST'
                 )
                 logger.info(f"Call back initiated with SID: {new_call.sid}")
-                active_calls[new_call.sid] = {"status": "initiated", "magic_words_spoken": False}
+                active_calls[new_call.sid] = {"status": "initiated", "magic_words_spoken": False, "endpoint": voice_endpoint}
             except Exception as e:
                 logger.error(f"Error calling back: {str(e)}")
         
@@ -400,6 +448,195 @@ async def handle_call(request: Request):
         response = VoiceResponse()
         response.say("I'm sorry, I encountered an error. Let's try again.")
         return Response(content=str(response), media_type="application/xml")
+
+@app.post("/voice-realtime")
+async def handle_call_realtime(request: Request):
+    """Handle voice call using OpenAI Realtime API with Media Streams"""
+    logger.info("Handling incoming voice call with Realtime API")
+    try:
+        # Validate the request is from Twilio
+        if not await validate_twilio_request(request):
+            raise HTTPException(status_code=403, detail="Invalid request signature")
+            
+        response = VoiceResponse()
+        
+        # Initial greeting for Realtime API
+        response.say("Good morning! Connecting you to your wake-up coach.")
+        
+        # Connect to Media Stream
+        connect = Connect()
+        # Use wss:// for WebSocket Secure if your server supports it, otherwise ws://
+        ws_url = BASE_URL.replace("http://", "ws://").replace("https://", "wss://")
+        connect.stream(url=f"{ws_url}/media-stream")
+        response.append(connect)
+        
+        # Return the response with the correct content type
+        logger.info("Returning TwiML response for Realtime API voice call")
+        return Response(content=str(response), media_type="application/xml")
+    except Exception as e:
+        logger.error(f"Error handling Realtime API voice call: {str(e)}")
+        # Fallback to regular voice endpoint
+        response = VoiceResponse()
+        response.say("I'm sorry, I encountered an error. Let me connect you differently.")
+        response.redirect('/voice')
+        return Response(content=str(response), media_type="application/xml")
+
+@app.websocket("/media-stream")
+async def media_stream(websocket: WebSocket):
+    """Handle Twilio Media Streams WebSocket connection and bridge to OpenAI Realtime API"""
+    await websocket.accept()
+    logger.info("Media Stream WebSocket connection established")
+    
+    openai_ws = None
+    stream_sid = None
+    call_sid = None
+    
+    try:
+        # Connect to OpenAI Realtime API
+        openai_ws = await websockets.connect(
+            'wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2024-10-01',
+            extra_headers={
+                "Authorization": f"Bearer {os.getenv('OPENAI_API_KEY')}",
+                "OpenAI-Beta": "realtime=v1"
+            }
+        )
+        logger.info("Connected to OpenAI Realtime API")
+        
+        # Configure the Realtime API session
+        session_update = {
+            "type": "session.update",
+            "session": {
+                "turn_detection": {"type": "server_vad"},
+                "input_audio_format": "g711_ulaw",
+                "output_audio_format": "g711_ulaw",
+                "voice": "alloy",
+                "instructions": (
+                    "You are a supportive wake-up coach calling to help someone wake up. "
+                    "Your goal is to help them wake up gently and start their day positively. "
+                    "Keep responses brief and encouraging. If they seem sleepy, engage them actively. "
+                    "Be conversational and warm. "
+                    "IMPORTANT: Tell the user they must physically get out of bed and touch their "
+                    "doorbell fingerprint reader before they can end the call. When they say they've "
+                    "done this or want to end the call, ask them to say 'goodbye' or 'end call' "
+                    "to finish the conversation."
+                ),
+                "modalities": ["text", "audio"],
+                "temperature": 0.8,
+            }
+        }
+        await openai_ws.send(json.dumps(session_update))
+        logger.info("OpenAI Realtime API session configured")
+        
+        # Send initial conversation item to have AI speak first
+        initial_item = {
+            "type": "conversation.item.create",
+            "item": {
+                "type": "message",
+                "role": "user",
+                "content": [
+                    {
+                        "type": "input_text",
+                        "text": "Greet the user warmly and ask how they're feeling this morning."
+                    }
+                ]
+            }
+        }
+        await openai_ws.send(json.dumps(initial_item))
+        await openai_ws.send(json.dumps({"type": "response.create"}))
+        logger.info("Initial greeting sent to OpenAI")
+        
+        async def receive_from_twilio():
+            """Receive audio from Twilio and send to OpenAI"""
+            nonlocal stream_sid, call_sid
+            try:
+                async for message in websocket.iter_text():
+                    data = json.loads(message)
+                    
+                    if data['event'] == 'start':
+                        stream_sid = data['start']['streamSid']
+                        call_sid = data['start']['callSid']
+                        logger.info(f"Stream started: {stream_sid}, Call: {call_sid}")
+                        
+                    elif data['event'] == 'media':
+                        # Forward audio to OpenAI
+                        audio_append = {
+                            "type": "input_audio_buffer.append",
+                            "audio": data['media']['payload']
+                        }
+                        await openai_ws.send(json.dumps(audio_append))
+                        
+                    elif data['event'] == 'stop':
+                        logger.info(f"Stream stopped: {stream_sid}")
+                        break
+                        
+            except WebSocketDisconnect:
+                logger.info("Twilio WebSocket disconnected")
+            except Exception as e:
+                logger.error(f"Error receiving from Twilio: {str(e)}")
+        
+        async def receive_from_openai():
+            """Receive audio from OpenAI and send to Twilio"""
+            try:
+                async for message in openai_ws:
+                    data = json.loads(message)
+                    
+                    if data.get('type') == 'response.audio.delta':
+                        # Send audio chunk to Twilio
+                        media_message = {
+                            "event": "media",
+                            "streamSid": stream_sid,
+                            "media": {
+                                "payload": data['delta']
+                            }
+                        }
+                        await websocket.send_json(media_message)
+                        
+                    elif data.get('type') == 'input_audio_buffer.speech_started':
+                        # User started speaking, clear buffer
+                        logger.info("User speech detected, clearing buffer")
+                        await websocket.send_json({
+                            "event": "clear",
+                            "streamSid": stream_sid
+                        })
+                        
+                    elif data.get('type') == 'conversation.item.input_audio_transcription.completed':
+                        # Log user transcription
+                        transcript = data.get('transcript', '')
+                        logger.info(f"User said: {transcript}")
+                        
+                        # Check for magic words
+                        if transcript and ("goodbye" in transcript.lower() or "end call" in transcript.lower()):
+                            if not doorbell_activated:
+                                logger.info("Magic words detected but doorbell not activated")
+                                # Let the AI handle this with its instructions
+                            else:
+                                logger.info("Magic words detected with doorbell activated - ending call")
+                                if call_sid in active_calls:
+                                    active_calls[call_sid]["magic_words_spoken"] = True
+                                # Close the connection gracefully
+                                await asyncio.sleep(2)  # Give time for final AI response
+                                break
+                                
+                    elif data.get('type') == 'error':
+                        logger.error(f"OpenAI error: {data}")
+                        
+            except websockets.exceptions.ConnectionClosed:
+                logger.info("OpenAI WebSocket connection closed")
+            except Exception as e:
+                logger.error(f"Error receiving from OpenAI: {str(e)}")
+        
+        # Run both directions concurrently
+        await asyncio.gather(
+            receive_from_twilio(),
+            receive_from_openai()
+        )
+        
+    except Exception as e:
+        logger.error(f"Error in media stream: {str(e)}")
+    finally:
+        if openai_ws:
+            await openai_ws.close()
+        logger.info("Media Stream WebSocket connection closed")
 
 @app.post("/handle-response")
 async def handle_response(request: Request):
@@ -556,17 +793,19 @@ async def check_wake_up_time():
                 (last_call_time is None or (now - last_call_time).total_seconds() > 3600)):  # 1 hour cooldown
                 logger.info(f"It's {WAKE_UP_TIME}! Making wake-up call to {PHONE_NUMBER}")
                 try:
+                    voice_endpoint = get_voice_endpoint()
+                    logger.info(f"Using {voice_endpoint} for wake-up call")
                     call = twilio_client.calls.create(
                         to=PHONE_NUMBER,
                         from_=TWILIO_PHONE_NUMBER,
-                        url=f"{BASE_URL}/voice",
+                        url=f"{BASE_URL}{voice_endpoint}",
                         status_callback=f"{BASE_URL}/call-status",
                         status_callback_event=['initiated', 'ringing', 'answered', 'completed'],
                         status_callback_method='POST'
                     )
                     last_call_time = now
                     logger.info(f"Wake-up call initiated with SID: {call.sid}")
-                    active_calls[call.sid] = {"status": "initiated", "magic_words_spoken": False}
+                    active_calls[call.sid] = {"status": "initiated", "magic_words_spoken": False, "endpoint": voice_endpoint}
                 except Exception as e:
                     logger.error(f"Error making wake-up call: {str(e)}")
             

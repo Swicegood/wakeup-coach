@@ -8,7 +8,7 @@ import json
 import time
 
 # Configuration
-BASE_URL = "http://YOUR_SERVER_IP:8765"  # Update with your server URL
+BASE_URL = "http://YOUR_DOMAIN:8765" # Update with your server URL
 
 def test_doorbell_status():
     """Test the doorbell status endpoint"""
