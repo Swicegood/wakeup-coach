@@ -1,0 +1,25 @@
+version: '3.3'
+
+# Alternative Docker Compose configuration using bridge networking
+# This should fix WebSocket connectivity issues caused by macvlan
+
+services:
+  wakeup-coach:
+    build: .
+    container_name: wakeup-coach
+    restart: unless-stopped
+    ports:
+      - "8765:8000"  # Using port 8765 externally, mapped to 8000 internally
+    # Using default bridge network instead of macvlan
+    volumes:
+      - ./config:/app/config
+    env_file:
+      - .env
+    environment:
+      - TZ=America/New_York
+      - PORT=8000  # Internal port
+      - EXTERNAL_PORT=8765  # External port for Twilio to use
+
+# No custom networks - use default bridge network
+# This allows WebSocket connections to work properly
+

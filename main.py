@@ -255,6 +255,22 @@ async def manual_activate_doorbell():
     activate_doorbell()
     return {"status": "success", "message": "Doorbell manually activated"}
 
+@app.get("/websocket-status")
+async def websocket_status():
+    """Check if WebSocket endpoints are registered"""
+    routes = []
+    for route in app.routes:
+        routes.append({
+            "path": route.path if hasattr(route, 'path') else str(route),
+            "type": type(route).__name__
+        })
+    return {
+        "status": "Server is running",
+        "websocket_support": "enabled",
+        "routes": routes,
+        "test_instructions": "Use a WebSocket client to connect to ws://YOUR_DOMAIN:8765/test-websocket"
+    }
+
 @app.websocket("/test-websocket")
 async def test_websocket(websocket: WebSocket):
     """Test WebSocket connectivity"""
@@ -914,4 +930,13 @@ async def startup_event():
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=int(INTERNAL_PORT)) 
+    uvicorn.run(
+        app, 
+        host="0.0.0.0", 
+        port=int(INTERNAL_PORT),
+        # WebSocket configuration
+        ws="auto",  # Auto-detect WebSocket library (websockets or wsproto)
+        ws_max_size=16777216,  # 16MB max WebSocket message size
+        timeout_keep_alive=300,  # 5 minutes keep-alive for long conversations
+        log_level="info"  # Ensure we see WebSocket connection logs
+    ) 
