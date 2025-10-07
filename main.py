@@ -610,23 +610,6 @@ async def media_stream(websocket: WebSocket):
     openai_ws = None
     stream_sid = None
     call_sid = None
-    goodbye_timeout_task = None
-    goodbye_detected = False
-    
-    async def end_call_after_timeout():
-        """End the call after a timeout period"""
-        nonlocal goodbye_detected
-        await asyncio.sleep(12)  # Wait 12 seconds for goodbye to be heard
-        if goodbye_detected and doorbell_activated:
-            logger.info("⏰ Timeout reached - ending call")
-            try:
-                await websocket.send_json({
-                    "event": "stop",
-                    "streamSid": stream_sid
-                })
-                logger.info("📞 Sent stop event to Twilio to end call")
-            except Exception as e:
-                logger.error(f"Error sending stop event: {str(e)}")
     
     try:
         logger.info("Attempting to connect to OpenAI Realtime API...")
@@ -661,7 +644,7 @@ async def media_stream(websocket: WebSocket):
                     "2. If the doorbell HAS been activated, say a brief goodbye like 'Great job getting up! Have a wonderful day!' and then END THE CONVERSATION IMMEDIATELY. "
                     "You will know the doorbell has been activated when the user mentions they've touched it or gotten out of bed."
                 ),
-                "modalities": ["audio"],
+                "modalities": ["text", "audio"],
                 "temperature": 0.8,
             }
         }
@@ -724,7 +707,7 @@ async def media_stream(websocket: WebSocket):
                     # Log ALL OpenAI events to debug audio processing
                     event_type = data.get('type', 'unknown')
                     logger.info(f"🤖 OpenAI Event: {event_type}")
-                    if event_type in ['response.audio.delta', 'response.done', 'error', 'session.updated']:
+                    if event_type in ['response.audio.delta', 'response.text.delta', 'response.done', 'error', 'session.updated']:
                         logger.info(f"🤖 OpenAI Event Details: {data}")
                     
                     if data.get('type') == 'response.audio.delta':
@@ -741,17 +724,47 @@ async def media_stream(websocket: WebSocket):
                     elif data.get('type') == 'input_audio_buffer.speech_started':
                         # User started speaking, clear buffer
                         logger.info("User speech detected, clearing buffer")
-                        
-                        # Check if doorbell is activated and start timeout if user might be saying goodbye
-                        if doorbell_activated and not goodbye_detected:
-                            logger.info("🚨 User speaking with doorbell activated - starting goodbye timeout")
-                            goodbye_detected = True
-                            goodbye_timeout_task = asyncio.create_task(end_call_after_timeout())
-                        
                         await websocket.send_json({
                             "event": "clear",
                             "streamSid": stream_sid
                         })
+                        
+                    elif data.get('type') == 'conversation.item.input_audio_transcription.completed':
+                        # Log user transcription with full details
+                        transcript = data.get('transcript', '')
+                        logger.info(f"🎤 TRANSCRIPTION COMPLETED: '{transcript}'")
+                        logger.info(f"Full transcription data: {data}")
+                        
+                        # Check for magic words with more flexible matching
+                        if transcript:
+                            transcript_lower = transcript.lower()
+                            magic_words = ['goodbye', 'end call', 'bye', 'hang up', 'stop', 'done']
+                            found_magic_word = any(word in transcript_lower for word in magic_words)
+                            
+                            logger.info(f"Magic word check: found_magic_word={found_magic_word}, doorbell_activated={doorbell_activated}")
+                            
+                            if found_magic_word:
+                                if not doorbell_activated:
+                                    logger.info("❌ Magic words detected but doorbell not activated - ignoring")
+                                    # Let the AI handle this with its instructions
+                                else:
+                                    logger.info("✅ Magic words detected with doorbell activated - ending call")
+                                    if call_sid in active_calls:
+                                        active_calls[call_sid]["magic_words_spoken"] = True
+                                    
+                                    # Send stop event to Twilio to end the call
+                                    try:
+                                        await websocket.send_json({
+                                            "event": "stop",
+                                            "streamSid": stream_sid
+                                        })
+                                        logger.info("📞 Sent stop event to Twilio to end call")
+                                    except Exception as e:
+                                        logger.error(f"Error sending stop event: {str(e)}")
+                                    
+                                    # Close the connection gracefully
+                                    await asyncio.sleep(2)  # Give time for final AI response
+                                    break
                         
                     elif data.get('type') == 'response.done':
                         # AI response completed
