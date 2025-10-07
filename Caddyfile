@@ -1,7 +1,8 @@
 # Caddy configuration for Wake-up Coach with automatic HTTPS
-# Replace YOUR_DOMAIN with your actual domain
+# External port 8443 is mapped to internal port 443 in docker-compose
+# Replace goloka.no-ip.biz with your actual domain if different
 
-YOUR_DOMAIN {
+goloka.no-ip.biz {
     # Automatic HTTPS with Let's Encrypt
     # Caddy will automatically obtain and renew SSL certificates
     
@@ -10,19 +11,18 @@ YOUR_DOMAIN {
         # WebSocket support
         header_up Upgrade {http.request.header.Upgrade}
         header_up Connection {http.request.header.Connection}
+        
+        # Pass the original host including port for Twilio signature validation
         header_up Host {http.request.host}
-        header_up X-Real-IP {http.request.remote.host}
-        header_up X-Forwarded-For {http.request.remote.host}
+        header_up X-Forwarded-Host {http.request.host}
         header_up X-Forwarded-Proto {http.request.scheme}
+        header_up X-Real-IP {http.request.remote.host}
     }
     
     # Enable access logs
     log {
-        output file /var/log/caddy/access.log
+        output stdout
         format console
     }
 }
-
-# Optional: Redirect HTTP to HTTPS (Caddy does this automatically)
-# But you can customize if needed
 

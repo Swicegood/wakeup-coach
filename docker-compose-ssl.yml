@@ -15,16 +15,16 @@ services:
     environment:
       - TZ=America/New_York
       - PORT=8000  # Internal port
-      - EXTERNAL_PORT=443  # External HTTPS port
-      # BASE_URL will be set in .env to https://YOUR_DOMAIN
+      - EXTERNAL_PORT=8443  # External HTTPS port
+      # BASE_URL will be set in .env to https://YOUR_DOMAIN:8443
 
   caddy:
     image: caddy:latest
     container_name: wakeup-coach-caddy
     restart: unless-stopped
     ports:
-      - "80:80"    # HTTP (for Let's Encrypt verification)
-      - "443:443"  # HTTPS
+      - "80:80"        # HTTP (for Let's Encrypt verification)
+      - "8443:443"     # Map external 8443 to internal 443
     volumes:
       - ./Caddyfile:/etc/caddy/Caddyfile
       - caddy_data:/data

@@ -49,7 +49,7 @@ PHONE_NUMBER = os.getenv("PHONE_NUMBER")
 TWILIO_PHONE_NUMBER = os.getenv("TWILIO_PHONE_NUMBER")
 INTERNAL_PORT = os.getenv("PORT", "8000")
 EXTERNAL_PORT = os.getenv("EXTERNAL_PORT", "8765")
-SERVER_IP = os.getenv("SERVER_IP", "YOUR_SERVER_IP")  # Your server's IP address
+SERVER_IP = os.getenv("SERVER_IP", "192.168.0.199")  # Your server's IP address
 BASE_URL = os.getenv("BASE_URL", f"http://{SERVER_IP}:{EXTERNAL_PORT}")
 DOORBELL_ACTIVATION_TIMEOUT = int(os.getenv("DOORBELL_ACTIVATION_TIMEOUT", "300"))  # 5 minutes default
 REALTIME_API_PROBABILITY = float(os.getenv("REALTIME_API_PROBABILITY", "0.5"))  # 50% chance by default
@@ -99,8 +99,29 @@ def get_voice_endpoint() -> str:
 async def validate_twilio_request(request: Request) -> bool:
     """Validate that the request is coming from Twilio"""
     try:
-        # Get the full URL
-        url = str(request.url)
+        # When behind a reverse proxy (Caddy), we need to reconstruct the original URL
+        # Get the X-Forwarded-Proto and X-Forwarded-Host headers set by Caddy
+        forwarded_proto = request.headers.get('X-Forwarded-Proto', 'https')
+        forwarded_host = request.headers.get('X-Forwarded-Host', request.headers.get('Host', ''))
+        
+        # Reconstruct the URL that Twilio originally called
+        if forwarded_host:
+            # Ensure the forwarded host includes the port if it's missing
+            if ':' not in forwarded_host and forwarded_proto == 'https':
+                # Add the default HTTPS port 8443 if missing
+                forwarded_host = f"{forwarded_host}:8443"
+            elif ':' not in forwarded_host and forwarded_proto == 'http':
+                # Add the default HTTP port 80 if missing
+                forwarded_host = f"{forwarded_host}:80"
+            
+            url = f"{forwarded_proto}://{forwarded_host}{request.url.path}"
+            if request.url.query:
+                url += f"?{request.url.query}"
+        else:
+            # Fallback to request URL
+            url = str(request.url)
+        
+        logger.debug(f"Validating Twilio request for URL: {url}")
         
         # Get the X-Twilio-Signature header
         twilio_signature = request.headers.get('X-Twilio-Signature')
@@ -115,7 +136,7 @@ async def validate_twilio_request(request: Request) -> bool:
         # Validate the request
         is_valid = validator.validate(url, params, twilio_signature)
         if not is_valid:
-            logger.warning("Invalid Twilio signature")
+            logger.warning(f"Invalid Twilio signature for URL: {url}")
         return is_valid
     except Exception as e:
         logger.error(f"Error validating Twilio request: {str(e)}")
@@ -268,7 +289,7 @@ async def websocket_status():
         "status": "Server is running",
         "websocket_support": "enabled",
         "routes": routes,
-        "test_instructions": "Use a WebSocket client to connect to ws://YOUR_DOMAIN:8765/test-websocket"
+        "test_instructions": "Use a WebSocket client to connect to ws://goloka.no-ip.biz:8765/test-websocket"
     }
 
 @app.websocket("/test-websocket")
@@ -589,13 +610,31 @@ async def media_stream(websocket: WebSocket):
     openai_ws = None
     stream_sid = None
     call_sid = None
+    goodbye_timeout_task = None
+    goodbye_detected = False
+    
+    async def end_call_after_timeout():
+        """End the call after a timeout period"""
+        nonlocal goodbye_detected
+        await asyncio.sleep(12)  # Wait 12 seconds for goodbye to be heard
+        if goodbye_detected and doorbell_activated:
+            logger.info("⏰ Timeout reached - ending call")
+            try:
+                await websocket.send_json({
+                    "event": "stop",
+                    "streamSid": stream_sid
+                })
+                logger.info("📞 Sent stop event to Twilio to end call")
+            except Exception as e:
+                logger.error(f"Error sending stop event: {str(e)}")
     
     try:
         logger.info("Attempting to connect to OpenAI Realtime API...")
         # Connect to OpenAI Realtime API
+        # Use additional_headers for newer websockets library
         openai_ws = await websockets.connect(
             'wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2024-10-01',
-            extra_headers={
+            additional_headers={
                 "Authorization": f"Bearer {os.getenv('OPENAI_API_KEY')}",
                 "OpenAI-Beta": "realtime=v1"
             }
@@ -615,12 +654,14 @@ async def media_stream(websocket: WebSocket):
                     "Your goal is to help them wake up gently and start their day positively. "
                     "Keep responses brief and encouraging. If they seem sleepy, engage them actively. "
                     "Be conversational and warm. "
-                    "IMPORTANT: Tell the user they must physically get out of bed and touch their "
-                    "doorbell fingerprint reader before they can end the call. When they say they've "
-                    "done this or want to end the call, ask them to say 'goodbye' or 'end call' "
-                    "to finish the conversation."
+                    "IMPORTANT: The user must physically get out of bed and touch their "
+                    "doorbell fingerprint reader before they can end the call. "
+                    "When the user says they want to end the call or says goodbye, you should: "
+                    "1. If the doorbell has NOT been activated, tell them they need to get out of bed and touch the doorbell first. "
+                    "2. If the doorbell HAS been activated, say a brief goodbye like 'Great job getting up! Have a wonderful day!' and then END THE CONVERSATION IMMEDIATELY. "
+                    "You will know the doorbell has been activated when the user mentions they've touched it or gotten out of bed."
                 ),
-                "modalities": ["text", "audio"],
+                "modalities": ["audio"],
                 "temperature": 0.8,
             }
         }
@@ -680,6 +721,12 @@ async def media_stream(websocket: WebSocket):
                 async for message in openai_ws:
                     data = json.loads(message)
                     
+                    # Log ALL OpenAI events to debug audio processing
+                    event_type = data.get('type', 'unknown')
+                    logger.info(f"🤖 OpenAI Event: {event_type}")
+                    if event_type in ['response.audio.delta', 'response.done', 'error', 'session.updated']:
+                        logger.info(f"🤖 OpenAI Event Details: {data}")
+                    
                     if data.get('type') == 'response.audio.delta':
                         # Send audio chunk to Twilio
                         media_message = {
@@ -694,28 +741,21 @@ async def media_stream(websocket: WebSocket):
                     elif data.get('type') == 'input_audio_buffer.speech_started':
                         # User started speaking, clear buffer
                         logger.info("User speech detected, clearing buffer")
+                        
+                        # Check if doorbell is activated and start timeout if user might be saying goodbye
+                        if doorbell_activated and not goodbye_detected:
+                            logger.info("🚨 User speaking with doorbell activated - starting goodbye timeout")
+                            goodbye_detected = True
+                            goodbye_timeout_task = asyncio.create_task(end_call_after_timeout())
+                        
                         await websocket.send_json({
                             "event": "clear",
                             "streamSid": stream_sid
                         })
                         
-                    elif data.get('type') == 'conversation.item.input_audio_transcription.completed':
-                        # Log user transcription
-                        transcript = data.get('transcript', '')
-                        logger.info(f"User said: {transcript}")
-                        
-                        # Check for magic words
-                        if transcript and ("goodbye" in transcript.lower() or "end call" in transcript.lower()):
-                            if not doorbell_activated:
-                                logger.info("Magic words detected but doorbell not activated")
-                                # Let the AI handle this with its instructions
-                            else:
-                                logger.info("Magic words detected with doorbell activated - ending call")
-                                if call_sid in active_calls:
-                                    active_calls[call_sid]["magic_words_spoken"] = True
-                                # Close the connection gracefully
-                                await asyncio.sleep(2)  # Give time for final AI response
-                                break
+                    elif data.get('type') == 'response.done':
+                        # AI response completed
+                        logger.info("🤖 AI Response completed")
                                 
                     elif data.get('type') == 'error':
                         logger.error(f"OpenAI error: {data}")

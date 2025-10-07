@@ -1,0 +1,38 @@
+version: '3.8'
+
+services:
+  wakeup-coach:
+    build: .
+    container_name: wakeup-coach
+    restart: unless-stopped
+    # No port exposure needed - Cloudflare Tunnel handles it
+    networks:
+      - wakeup_network
+    volumes:
+      - ./config:/app/config
+    env_file:
+      - .env
+    environment:
+      - TZ=America/New_York
+      - PORT=8000
+      - EXTERNAL_PORT=443
+      # BASE_URL will be set in .env to https://YOUR_DOMAIN
+
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    container_name: wakeup-coach-tunnel
+    restart: unless-stopped
+    command: tunnel --no-autoupdate run
+    networks:
+      - wakeup_network
+    volumes:
+      - ./cloudflared:/etc/cloudflared
+    environment:
+      - TUNNEL_TOKEN=${CLOUDFLARE_TUNNEL_TOKEN}
+    depends_on:
+      - wakeup-coach
+
+networks:
+  wakeup_network:
+    driver: bridge
+
