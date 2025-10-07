@@ -729,11 +729,12 @@ async def media_stream(websocket: WebSocket):
                 async for message in openai_ws:
                     data = json.loads(message)
                     
-                    # Log ALL OpenAI events to debug audio processing
+                    # Log important OpenAI events only (skip audio deltas to reduce log spam)
                     event_type = data.get('type', 'unknown')
-                    logger.info(f"🤖 OpenAI Event: {event_type}")
-                    if event_type in ['response.audio.delta', 'response.text.delta', 'response.done', 'error', 'session.updated']:
-                        logger.info(f"🤖 OpenAI Event Details: {data}")
+                    if event_type not in ['response.audio.delta']:
+                        logger.info(f"🤖 OpenAI Event: {event_type}")
+                        if event_type in ['response.text.delta', 'response.done', 'error', 'session.updated', 'conversation.item.input_audio_transcription.completed']:
+                            logger.info(f"🤖 OpenAI Event Details: {data}")
                     
                     if data.get('type') == 'response.audio.delta':
                         # Send audio chunk to Twilio
