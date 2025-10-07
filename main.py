@@ -610,6 +610,21 @@ async def media_stream(websocket: WebSocket):
     openai_ws = None
     stream_sid = None
     call_sid = None
+    doorbell_timeout_task = None
+    
+    async def end_call_after_doorbell_timeout():
+        """End the call 30 seconds after doorbell activation"""
+        await asyncio.sleep(30)  # Wait 30 seconds
+        if doorbell_activated:
+            logger.info("⏰ 30 seconds elapsed since doorbell activation - ending call")
+            try:
+                await websocket.send_json({
+                    "event": "stop",
+                    "streamSid": stream_sid
+                })
+                logger.info("📞 Sent stop event to Twilio to end call")
+            except Exception as e:
+                logger.error(f"Error sending stop event: {str(e)}")
     
     try:
         logger.info("Attempting to connect to OpenAI Realtime API...")
@@ -669,6 +684,11 @@ async def media_stream(websocket: WebSocket):
         await openai_ws.send(json.dumps({"type": "response.create"}))
         logger.info("Initial greeting sent to OpenAI")
         
+        # Start doorbell timeout if doorbell is already activated
+        if doorbell_activated and doorbell_timeout_task is None:
+            logger.info("🚨 Doorbell already activated - starting 30-second timeout")
+            doorbell_timeout_task = asyncio.create_task(end_call_after_doorbell_timeout())
+        
         async def receive_from_twilio():
             """Receive audio from Twilio and send to OpenAI"""
             nonlocal stream_sid, call_sid
@@ -701,6 +721,11 @@ async def media_stream(websocket: WebSocket):
         async def receive_from_openai():
             """Receive audio from OpenAI and send to Twilio"""
             try:
+                # Check for doorbell activation and start timeout if needed
+                if doorbell_activated and doorbell_timeout_task is None:
+                    logger.info("🚨 Doorbell activated during call - starting 30-second timeout")
+                    doorbell_timeout_task = asyncio.create_task(end_call_after_doorbell_timeout())
+                
                 async for message in openai_ws:
                     data = json.loads(message)
                     
@@ -730,41 +755,10 @@ async def media_stream(websocket: WebSocket):
                         })
                         
                     elif data.get('type') == 'conversation.item.input_audio_transcription.completed':
-                        # Log user transcription with full details
+                        # Log user transcription (simple logging only)
                         transcript = data.get('transcript', '')
-                        logger.info(f"🎤 TRANSCRIPTION COMPLETED: '{transcript}'")
-                        logger.info(f"Full transcription data: {data}")
-                        
-                        # Check for magic words with more flexible matching
-                        if transcript:
-                            transcript_lower = transcript.lower()
-                            magic_words = ['goodbye', 'end call', 'bye', 'hang up', 'stop', 'done']
-                            found_magic_word = any(word in transcript_lower for word in magic_words)
-                            
-                            logger.info(f"Magic word check: found_magic_word={found_magic_word}, doorbell_activated={doorbell_activated}")
-                            
-                            if found_magic_word:
-                                if not doorbell_activated:
-                                    logger.info("❌ Magic words detected but doorbell not activated - ignoring")
-                                    # Let the AI handle this with its instructions
-                                else:
-                                    logger.info("✅ Magic words detected with doorbell activated - ending call")
-                                    if call_sid in active_calls:
-                                        active_calls[call_sid]["magic_words_spoken"] = True
-                                    
-                                    # Send stop event to Twilio to end the call
-                                    try:
-                                        await websocket.send_json({
-                                            "event": "stop",
-                                            "streamSid": stream_sid
-                                        })
-                                        logger.info("📞 Sent stop event to Twilio to end call")
-                                    except Exception as e:
-                                        logger.error(f"Error sending stop event: {str(e)}")
-                                    
-                                    # Close the connection gracefully
-                                    await asyncio.sleep(2)  # Give time for final AI response
-                                    break
+                        logger.info(f"🎤 User said: '{transcript}'")
+                        # Note: We're using 30-second timeout instead of magic word detection
                         
                     elif data.get('type') == 'response.done':
                         # AI response completed
