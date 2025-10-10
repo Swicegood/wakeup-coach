@@ -467,6 +467,8 @@ async def initiate_call():
 @app.post("/call-status")
 async def call_status(request: Request):
     """Handle call status updates from Twilio"""
+    global doorbell_activated, doorbell_activation_time, doorbell_timeout_task
+    
     try:
         # Validate the request is from Twilio
         if not await validate_twilio_request(request):
@@ -488,16 +490,24 @@ async def call_status(request: Request):
         should_callback = False
         if call_status == "completed" and call_sid in active_calls:
             endpoint = active_calls[call_sid].get("endpoint", "")
-            doorbell_activated = active_calls[call_sid].get("doorbell_activated", False)
+            call_doorbell_activated = active_calls[call_sid].get("doorbell_activated", False)
             magic_words_spoken = active_calls[call_sid].get("magic_words_spoken", False)
             
             if endpoint == "/voice-realtime":
                 # For Realtime API: only call back if doorbell was NOT activated
-                should_callback = not doorbell_activated
+                should_callback = not call_doorbell_activated
                 if should_callback:
                     logger.info(f"Realtime call {call_sid} ended without doorbell activation. Calling back...")
                 else:
                     logger.info(f"Realtime call {call_sid} ended with doorbell activation. Not calling back.")
+                    # Reset global doorbell flag since call ended successfully
+                    doorbell_activated = False
+                    doorbell_activation_time = None
+                    if doorbell_timeout_task and not doorbell_timeout_task.done():
+                        doorbell_timeout_task.cancel()
+                    # Clean up this call from active_calls
+                    del active_calls[call_sid]
+                    logger.info("🔓 Global doorbell_activated flag reset - ready for next day")
             else:
                 # For Traditional API: call back if magic words weren't spoken
                 should_callback = not magic_words_spoken
@@ -505,6 +515,15 @@ async def call_status(request: Request):
                     logger.info(f"Traditional call {call_sid} ended without magic words. Calling back...")
                 else:
                     logger.info(f"Traditional call {call_sid} ended with magic words. Not calling back.")
+                    # Reset global doorbell flag since call ended successfully (if it was set)
+                    if call_doorbell_activated:
+                        doorbell_activated = False
+                        doorbell_activation_time = None
+                        if doorbell_timeout_task and not doorbell_timeout_task.done():
+                            doorbell_timeout_task.cancel()
+                        logger.info("🔓 Global doorbell_activated flag reset")
+                    # Clean up this call from active_calls
+                    del active_calls[call_sid]
         
         if should_callback:
             # Wait a short time before calling back
@@ -636,10 +655,19 @@ async def media_stream(websocket: WebSocket):
         """End the call 30 seconds after doorbell activation"""
         logger.info("⏰ Starting 30-second doorbell timeout timer")
         
+        # Wait for call_sid to be available, then mark it
+        max_wait = 10  # Wait up to 10 seconds for call_sid
+        waited = 0
+        while not call_sid and waited < max_wait:
+            await asyncio.sleep(0.5)
+            waited += 0.5
+        
         # Mark this call as having doorbell activated so it won't trigger a callback
         if call_sid and call_sid in active_calls:
             active_calls[call_sid]["doorbell_activated"] = True
             logger.info(f"📋 Marked call {call_sid} as doorbell_activated=True in active_calls")
+        else:
+            logger.warning(f"⚠️ Could not mark call as doorbell_activated - call_sid not available or not in active_calls")
         
         await asyncio.sleep(30)  # Wait 30 seconds
         if doorbell_activated and call_sid:
@@ -738,6 +766,11 @@ async def media_stream(websocket: WebSocket):
                         stream_sid = data['start']['streamSid']
                         call_sid = data['start']['callSid']
                         logger.info(f"Stream started: {stream_sid}, Call: {call_sid}")
+                        
+                        # If doorbell timer is already running, mark this call immediately
+                        if doorbell_timeout_task and not doorbell_timeout_task.done() and call_sid in active_calls:
+                            active_calls[call_sid]["doorbell_activated"] = True
+                            logger.info(f"📋 Timer already running - immediately marked call {call_sid} as doorbell_activated=True")
                         
                     elif data['event'] == 'media':
                         # Forward audio to OpenAI
