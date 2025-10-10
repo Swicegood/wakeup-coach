@@ -614,6 +614,7 @@ async def media_stream(websocket: WebSocket):
     
     async def end_call_after_doorbell_timeout():
         """End the call 30 seconds after doorbell activation"""
+        logger.info("⏰ Starting 30-second doorbell timeout timer")
         await asyncio.sleep(30)  # Wait 30 seconds
         if doorbell_activated:
             logger.info("⏰ 30 seconds elapsed since doorbell activation - ending call")
@@ -625,13 +626,15 @@ async def media_stream(websocket: WebSocket):
                 logger.info("📞 Sent stop event to Twilio to end call")
             except Exception as e:
                 logger.error(f"Error sending stop event: {str(e)}")
+        else:
+            logger.info("⏰ 30-second timeout reached but doorbell no longer activated - not ending call")
     
     try:
         logger.info("Attempting to connect to OpenAI Realtime API...")
         # Connect to OpenAI Realtime API
         # Use additional_headers for newer websockets library
         openai_ws = await websockets.connect(
-            'wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2024-10-01',
+            'wss://api.openai.com/v1/realtime?model=gpt-realtime-mini',
             additional_headers={
                 "Authorization": f"Bearer {os.getenv('OPENAI_API_KEY')}",
                 "OpenAI-Beta": "realtime=v1"
@@ -646,7 +649,7 @@ async def media_stream(websocket: WebSocket):
                 "turn_detection": {"type": "server_vad"},
                 "input_audio_format": "g711_ulaw",
                 "output_audio_format": "g711_ulaw",
-                "voice": "alloy",
+                "voice": "sage",
                 "instructions": (
                     "You are a supportive wake-up coach calling to help someone wake up. "
                     "Your goal is to help them wake up gently and start their day positively. "
@@ -691,10 +694,15 @@ async def media_stream(websocket: WebSocket):
         
         async def receive_from_twilio():
             """Receive audio from Twilio and send to OpenAI"""
-            nonlocal stream_sid, call_sid
+            nonlocal stream_sid, call_sid, doorbell_timeout_task
             try:
                 async for message in websocket.iter_text():
                     data = json.loads(message)
+                    
+                    # Check for doorbell activation periodically and start timeout if needed
+                    if doorbell_activated and doorbell_timeout_task is None:
+                        logger.info("🚨 Doorbell activated during call (Twilio loop) - starting 30-second timeout")
+                        doorbell_timeout_task = asyncio.create_task(end_call_after_doorbell_timeout())
                     
                     if data['event'] == 'start':
                         stream_sid = data['start']['streamSid']
@@ -720,6 +728,7 @@ async def media_stream(websocket: WebSocket):
         
         async def receive_from_openai():
             """Receive audio from OpenAI and send to Twilio"""
+            nonlocal doorbell_timeout_task
             try:
                 # Check for doorbell activation and start timeout if needed
                 if doorbell_activated and doorbell_timeout_task is None:
@@ -728,6 +737,11 @@ async def media_stream(websocket: WebSocket):
                 
                 async for message in openai_ws:
                     data = json.loads(message)
+                    
+                    # Check for doorbell activation periodically and start timeout if needed
+                    if doorbell_activated and doorbell_timeout_task is None:
+                        logger.info("🚨 Doorbell activated during call - starting 30-second timeout")
+                        doorbell_timeout_task = asyncio.create_task(end_call_after_doorbell_timeout())
                     
                     # Log important OpenAI events only (skip audio deltas to reduce log spam)
                     event_type = data.get('type', 'unknown')
