@@ -327,7 +327,7 @@ async def test_call():
             status_callback_method='POST'
         )
         logger.info(f"Test call initiated with SID: {call.sid}")
-        active_calls[call.sid] = {"status": "initiated", "magic_words_spoken": False, "endpoint": voice_endpoint}
+        active_calls[call.sid] = {"status": "initiated", "magic_words_spoken": False, "doorbell_activated": False, "endpoint": voice_endpoint}
         return {"status": "Test call initiated", "call_sid": call.sid, "using_realtime_api": voice_endpoint == "/voice-realtime"}
     except Exception as e:
         logger.error(f"Error initiating test call: {str(e)}")
@@ -348,7 +348,7 @@ async def test_call_realtime():
             status_callback_method='POST'
         )
         logger.info(f"Realtime API test call initiated with SID: {call.sid}")
-        active_calls[call.sid] = {"status": "initiated", "magic_words_spoken": False, "endpoint": voice_endpoint}
+        active_calls[call.sid] = {"status": "initiated", "magic_words_spoken": False, "doorbell_activated": False, "endpoint": voice_endpoint}
         return {"status": "Realtime API test call initiated", "call_sid": call.sid, "using_realtime_api": True}
     except Exception as e:
         logger.error(f"Error initiating Realtime API test call: {str(e)}")
@@ -369,7 +369,7 @@ async def test_call_traditional():
             status_callback_method='POST'
         )
         logger.info(f"Traditional API test call initiated with SID: {call.sid}")
-        active_calls[call.sid] = {"status": "initiated", "magic_words_spoken": False, "endpoint": voice_endpoint}
+        active_calls[call.sid] = {"status": "initiated", "magic_words_spoken": False, "doorbell_activated": False, "endpoint": voice_endpoint}
         return {"status": "Traditional API test call initiated", "call_sid": call.sid, "using_realtime_api": False}
     except Exception as e:
         logger.error(f"Error initiating Traditional API test call: {str(e)}")
@@ -404,7 +404,7 @@ async def schedule_test(request: ScheduleRequest):
                     status_callback_method='POST'
                 )
                 logger.info(f"Scheduled test call made at {datetime.now()} with SID: {call.sid}")
-                active_calls[call.sid] = {"status": "initiated", "magic_words_spoken": False, "endpoint": voice_endpoint}
+                active_calls[call.sid] = {"status": "initiated", "magic_words_spoken": False, "doorbell_activated": False, "endpoint": voice_endpoint}
                 if task_id in scheduled_tasks:
                     del scheduled_tasks[task_id]
             except Exception as e:
@@ -458,7 +458,7 @@ async def initiate_call():
             status_callback_method='POST'
         )
         logger.info(f"Wake-up call initiated with SID: {call.sid}")
-        active_calls[call.sid] = {"status": "initiated", "magic_words_spoken": False, "endpoint": voice_endpoint}
+        active_calls[call.sid] = {"status": "initiated", "magic_words_spoken": False, "doorbell_activated": False, "endpoint": voice_endpoint}
         return {"status": "Call initiated", "call_sid": call.sid, "using_realtime_api": voice_endpoint == "/voice-realtime"}
     except Exception as e:
         logger.error(f"Error initiating wake-up call: {str(e)}")
@@ -482,11 +482,31 @@ async def call_status(request: Request):
         if call_sid in active_calls:
             active_calls[call_sid]["status"] = call_status
         else:
-            active_calls[call_sid] = {"status": call_status, "magic_words_spoken": False}
+            active_calls[call_sid] = {"status": call_status, "magic_words_spoken": False, "doorbell_activated": False}
         
-        # If call is completed and magic words weren't spoken, call back
-        if call_status == "completed" and call_sid in active_calls and not active_calls[call_sid].get("magic_words_spoken", False):
-            logger.info(f"Call {call_sid} ended without magic words. Calling back...")
+        # Determine if we should call back based on the endpoint type
+        should_callback = False
+        if call_status == "completed" and call_sid in active_calls:
+            endpoint = active_calls[call_sid].get("endpoint", "")
+            doorbell_activated = active_calls[call_sid].get("doorbell_activated", False)
+            magic_words_spoken = active_calls[call_sid].get("magic_words_spoken", False)
+            
+            if endpoint == "/voice-realtime":
+                # For Realtime API: only call back if doorbell was NOT activated
+                should_callback = not doorbell_activated
+                if should_callback:
+                    logger.info(f"Realtime call {call_sid} ended without doorbell activation. Calling back...")
+                else:
+                    logger.info(f"Realtime call {call_sid} ended with doorbell activation. Not calling back.")
+            else:
+                # For Traditional API: call back if magic words weren't spoken
+                should_callback = not magic_words_spoken
+                if should_callback:
+                    logger.info(f"Traditional call {call_sid} ended without magic words. Calling back...")
+                else:
+                    logger.info(f"Traditional call {call_sid} ended with magic words. Not calling back.")
+        
+        if should_callback:
             # Wait a short time before calling back
             await asyncio.sleep(5)
             try:
@@ -501,7 +521,7 @@ async def call_status(request: Request):
                     status_callback_method='POST'
                 )
                 logger.info(f"Call back initiated with SID: {new_call.sid}")
-                active_calls[new_call.sid] = {"status": "initiated", "magic_words_spoken": False, "endpoint": voice_endpoint}
+                active_calls[new_call.sid] = {"status": "initiated", "magic_words_spoken": False, "doorbell_activated": False, "endpoint": voice_endpoint}
             except Exception as e:
                 logger.error(f"Error calling back: {str(e)}")
         
@@ -615,6 +635,12 @@ async def media_stream(websocket: WebSocket):
     async def end_call_after_doorbell_timeout():
         """End the call 30 seconds after doorbell activation"""
         logger.info("⏰ Starting 30-second doorbell timeout timer")
+        
+        # Mark this call as having doorbell activated so it won't trigger a callback
+        if call_sid and call_sid in active_calls:
+            active_calls[call_sid]["doorbell_activated"] = True
+            logger.info(f"📋 Marked call {call_sid} as doorbell_activated=True in active_calls")
+        
         await asyncio.sleep(30)  # Wait 30 seconds
         if doorbell_activated and call_sid:
             logger.info(f"⏰ 30 seconds elapsed since doorbell activation - ending call {call_sid}")
@@ -988,7 +1014,7 @@ async def check_wake_up_time():
                     )
                     last_call_time = now
                     logger.info(f"Wake-up call initiated with SID: {call.sid}")
-                    active_calls[call.sid] = {"status": "initiated", "magic_words_spoken": False, "endpoint": voice_endpoint}
+                    active_calls[call.sid] = {"status": "initiated", "magic_words_spoken": False, "doorbell_activated": False, "endpoint": voice_endpoint}
                 except Exception as e:
                     logger.error(f"Error making wake-up call: {str(e)}")
             
