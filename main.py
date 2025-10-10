@@ -616,18 +616,22 @@ async def media_stream(websocket: WebSocket):
         """End the call 30 seconds after doorbell activation"""
         logger.info("⏰ Starting 30-second doorbell timeout timer")
         await asyncio.sleep(30)  # Wait 30 seconds
-        if doorbell_activated:
-            logger.info("⏰ 30 seconds elapsed since doorbell activation - ending call")
+        if doorbell_activated and call_sid:
+            logger.info(f"⏰ 30 seconds elapsed since doorbell activation - ending call {call_sid}")
             try:
-                await websocket.send_json({
-                    "event": "stop",
-                    "streamSid": stream_sid
-                })
-                logger.info("📞 Sent stop event to Twilio to end call")
+                # Use Twilio REST API to actually hang up the call
+                await asyncio.to_thread(
+                    twilio_client.calls(call_sid).update,
+                    status='completed'
+                )
+                logger.info(f"📞 Successfully ended call {call_sid} via Twilio REST API")
             except Exception as e:
-                logger.error(f"Error sending stop event: {str(e)}")
+                logger.error(f"Error ending call via Twilio API: {str(e)}")
         else:
-            logger.info("⏰ 30-second timeout reached but doorbell no longer activated - not ending call")
+            if not doorbell_activated:
+                logger.info("⏰ 30-second timeout reached but doorbell no longer activated - not ending call")
+            if not call_sid:
+                logger.warning("⏰ 30-second timeout reached but call_sid is not available - cannot end call")
     
     try:
         logger.info("Attempting to connect to OpenAI Realtime API...")
